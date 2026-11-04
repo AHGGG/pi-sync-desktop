@@ -1,0 +1,70 @@
+{
+  "theme": "light",
+  "packages": [
+    "npm:@juanibiapina/pi-extension-settings",
+    "npm:pi-cc-extensions",
+    {
+      "source": "git:github.com/fitchmultz/pi-agent-browser-native@v0.9.13",
+      "extensions": [
+        "-dist/extensions/agent-browser/index.js"
+      ]
+    },
+    "npm:@narumitw/pi-goal",
+    "npm:@juicesharp/rpiv-ask-user-question",
+    "npm:@juicesharp/rpiv-todo",
+    "npm:@ff-labs/pi-fff",
+    "npm:@tmustier/pi-raw-paste",
+    "npm:@victor-software-house/pi-curated-themes",
+    "npm:pi-cache-optimizer",
+    "npm:@mrclrchtr/supi-context",
+    "npm:pi-kanban0",
+    "npm:@gotgenes/pi-permission-system",
+    "npm:@baylarsadigov/omp-undo-redo",
+    "git:github.com/AHGGG/pi-subagents",
+    "git:github.com/AHGGG/pi-fast-resume@main",
+    {
+      "source": "git:github.com/AHGGG/pi-extensions@main",
+      "extensions": [
+        "packages/pi-codex-compact/src/index.ts",
+        "-packages/pi-cache-hit-monitor/src/index.ts"
+      ],
+      "skills": [],
+      "prompts": [],
+      "themes": []
+    },
+    "git:github.com/AHGGG/pi-chatgpt-zstd",
+    "git:github.com/AHGGG/pi-background-compaction@master"
+  ],
+  "defaultThinkingLevel": "max",
+  "enableSkillCommands": false,
+  "treeFilterMode": "user-only",
+  "tuiMode": "fullscreen",
+  "fullscreenScrollbar": "auto",
+  "transport": "auto",
+  "httpIdleTimeoutMs": 900000,
+  "retry": {
+    "enabled": true,
+    "maxRetries": 60,
+    "baseDelayMs": 3000
+  },
+  "hideThinkingBlock": true,
+  "fullscreenCopyOnSelect": true,
+  "showCacheMissNotices": true,
+  "markdown": {
+    "mermaid": "final"
+  },
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 15000,
+    "keepRecentTokens": 5000
+  },
+  "terminal": {
+    "showImages": false,
+    "imageWidthCells": 60
+  },
+  "images": {
+    "autoResize": true
+  },
+  "steeringMode": "all",
+  "doubleEscapeAction": "tree"
+}

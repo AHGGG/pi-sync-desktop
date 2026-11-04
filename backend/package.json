@@ -1,0 +1,1 @@
+{"name":"pi-sync-desktop-backend","private":true,"type":"module","engines":{"node":">=20"},"scripts":{"test":"node --test tests/*.test.mjs","check":"node --check bridge.mjs && node --check engine.mjs && node --check worker.mjs"}}

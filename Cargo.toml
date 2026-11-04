@@ -1,0 +1,27 @@
+[workspace]
+members = ["crates/sync-core", "crates/desktop"]
+default-members = ["crates/desktop"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+repository = "https://github.com/AHGGG/pi-sync-desktop"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = "1"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
+
+[profile.dev]
+debug = 0

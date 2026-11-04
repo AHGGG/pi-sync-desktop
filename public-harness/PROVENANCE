@@ -1,0 +1,4 @@
+Public configuration copied from AHGGG/my-pi-harness.
+Commit: 1d8b17443cfd89f29d3ebf4fbfcaddb30efff0f0
+License: MIT (see ../LICENSE)
+Only public shared configuration is bundled. No device models or credentials.

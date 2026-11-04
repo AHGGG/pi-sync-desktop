@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "argent": {
+      "command": "argent",
+      "args": [
+        "mcp"
+      ],
+      "description": "Argent mobile/desktop device automation: boot emulators and simulators, UI interact and await, Metro CDP debugger, native profilers, screenshot diff, flows",
+      "exposure": "codemode",
+      "timeout": 600
+    }
+  }
+}
