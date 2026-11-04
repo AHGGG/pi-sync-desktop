@@ -891,8 +891,14 @@ mod tests {
     #[test]
     fn embedded_bridge_previews_resolves_and_applies_without_touching_other_values() {
         let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("source");
-        let target = root.path().join("target");
+        // macOS temporary paths can traverse /var -> /private/var. Resolve that
+        // fixture alias without weakening the worker's symlink rejection.
+        #[cfg(target_os = "macos")]
+        let root_path = fs::canonicalize(root.path()).unwrap();
+        #[cfg(not(target_os = "macos"))]
+        let root_path = root.path().to_path_buf();
+        let source = root_path.join("source");
+        let target = root_path.join("target");
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(&target).unwrap();
         fs::write(source.join("settings.json"), r#"{"theme":"light"}"#).unwrap();
@@ -902,7 +908,7 @@ mod tests {
             &mut engine,
             json!({"id":1,"op":"preview","source":{"id":"source","type":"local","agentDir":source},"targets":[{"id":"target","type":"local","agentDir":target}],"items":["settings"]}),
         );
-        assert_eq!(preview["ok"], true);
+        assert_eq!(preview["ok"], true, "fixture preview failed: {preview}");
         assert_eq!(preview["targets"][0]["status"], "conflicts");
         let unchanged: Value =
             serde_json::from_slice(&fs::read(target.join("settings.json")).unwrap()).unwrap();
