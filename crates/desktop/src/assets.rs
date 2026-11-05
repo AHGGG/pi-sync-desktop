@@ -27,7 +27,15 @@ mod tests {
     use super::*;
     #[test]
     fn device_and_standard_icons_are_bundled() {
-        for icon in ["globe", "laptop", "monitor", "server", "check"] {
+        for icon in [
+            "globe",
+            "laptop",
+            "monitor",
+            "server",
+            "check",
+            "chevron-left",
+            "chevron-right",
+        ] {
             let bytes = AppAssets
                 .load(&format!("icons/{icon}.svg"))
                 .unwrap()

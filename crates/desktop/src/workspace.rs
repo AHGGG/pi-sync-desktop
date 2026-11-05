@@ -3,11 +3,14 @@
 use crate::ui_model::*;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, Selectable, Sizable, WindowExt,
+    ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, WindowExt,
     button::{Button, ButtonCustomVariant, ButtonVariants},
     checkbox::Checkbox,
     dialog::DialogButtonProps,
-    diff::{Diff, DiffFile, DiffHunkSeparator, DiffMode, DiffSide, DiffState},
+    diff::{
+        Diff, DiffDecoration, DiffFile, DiffHunkSeparator, DiffLinePosition, DiffLineRange,
+        DiffMode, DiffSide, DiffState,
+    },
     form::{Field, Form},
     input::{Input, InputState},
     resizable::{h_resizable, resizable_panel},
@@ -29,7 +32,11 @@ actions!(
         RefreshDevices,
         PrepareReview,
         RepeatSelection,
-        SelectAllSourceChanges
+        SelectAllSourceChanges,
+        ChooseReviewSource,
+        ChooseReviewTarget,
+        PreviousReviewHunk,
+        NextReviewHunk
     ]
 );
 
@@ -51,6 +58,41 @@ impl Render for DragItem {
     }
 }
 
+/// Navigation is retained independently of scroll position: multiple hunks can
+/// fit in the viewport, and scrolling to a near-bottom hunk can be clamped.
+struct ReviewDiff {
+    state: Entity<DiffState>,
+    hunks: Vec<Vec<DiffLineRange>>,
+    active: usize,
+}
+
+impl ReviewDiff {
+    fn can_move(&self, forward: bool) -> bool {
+        if forward {
+            self.active + 1 < self.hunks.len()
+        } else {
+            self.active > 0
+        }
+    }
+}
+
+/// A version choice must not consume text-selection or modifier gestures.
+fn review_content_click(event: &ClickEvent) -> bool {
+    match event {
+        ClickEvent::Mouse(mouse) => {
+            let moved = mouse.up.position - mouse.down.position;
+            mouse.down.button == MouseButton::Left
+                && mouse.down.click_count == 1
+                && mouse.down.modifiers == Modifiers::default()
+                && mouse.up.modifiers == Modifiers::default()
+                && moved.x.abs() <= px(3.)
+                && moved.y.abs() <= px(3.)
+        }
+        ClickEvent::Touch(_) => true,
+        ClickEvent::Keyboard(_) => false,
+    }
+}
+
 pub(crate) struct Workspace {
     commands: Sender<Command>,
     snapshot: Snapshot,
@@ -68,7 +110,9 @@ pub(crate) struct Workspace {
     review_pending_only: bool,
     review_hovered_side: Option<Choice>,
     review_hover_owner: Option<&'static str>,
-    review_diffs: BTreeMap<String, Entity<DiffState>>,
+    review_diffs: BTreeMap<String, ReviewDiff>,
+    review_pointer: Option<(String, Point<Pixels>, bool)>,
+    review_pointer_blocked: bool,
     setup_name: Entity<InputState>,
     setup_ssh: Entity<InputState>,
     setup_root: Entity<InputState>,
@@ -83,6 +127,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.bind_keys([
+            KeyBinding::new("alt-left", ChooseReviewSource, Some("PiSync")),
+            KeyBinding::new("alt-right", ChooseReviewTarget, Some("PiSync")),
+            KeyBinding::new("alt-up", PreviousReviewHunk, Some("PiSync")),
+            KeyBinding::new("alt-down", NextReviewHunk, Some("PiSync")),
             KeyBinding::new(
                 if cfg!(target_os = "macos") {
                     "cmd-r"
@@ -149,6 +197,8 @@ impl Workspace {
             review_hovered_side: None,
             review_hover_owner: None,
             review_diffs: BTreeMap::new(),
+            review_pointer: None,
+            review_pointer_blocked: true,
             setup_name: cx.new(|cx| InputState::new(window, cx).placeholder("Work laptop")),
             setup_ssh: cx
                 .new(|cx| InputState::new(window, cx).placeholder("ssh [user@]host-or-alias")),
@@ -172,6 +222,8 @@ impl Workspace {
     }
     fn invalidate_review(&mut self) {
         self.review_diffs.clear();
+        self.review_pointer = None;
+        self.review_pointer_blocked = true;
         self.review_change_id = None;
         self.review_pending_only = false;
         self.review_hovered_side = None;
@@ -216,6 +268,9 @@ impl Workspace {
     pub(crate) fn receive(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             Event::Snapshot(snapshot) => {
+                // Do not complete a press against preview content replaced mid-gesture.
+                self.review_pointer = None;
+                self.review_pointer_blocked = true;
                 if !self.initial_snapshot_received {
                     self.onboarding = !snapshot
                         .devices
@@ -240,6 +295,7 @@ impl Workspace {
                     self.review_hover_owner = None;
                     self.choices.clear();
                 }
+                let same_plan = snapshot.plan_id == self.snapshot.plan_id;
                 self.review_diffs = snapshot
                     .changes
                     .iter()
@@ -255,6 +311,22 @@ impl Workspace {
                         } else {
                             (&change.before, &change.after)
                         };
+                        // Preserve navigation, text selection and scroll for an unchanged
+                        // preview (for example when command details are revealed elsewhere).
+                        if same_plan
+                            && self.snapshot.changes.iter().any(|old| {
+                                old.id == change.id
+                                    && old.path == change.path
+                                    && old.before == change.before
+                                    && old.after == change.after
+                                    && old.source_available == change.source_available
+                            })
+                            && self.snapshot.text_previews.get(&change.id)
+                                == snapshot.text_previews.get(&change.id)
+                            && let Some(diff) = self.review_diffs.remove(&change.id)
+                        {
+                            return Some((change.id.clone(), diff));
+                        }
                         // Constant patch filenames keep path/control characters out of the parser.
                         // Full domain paths remain visible in the application's own headers.
                         let extension = if change.id.contains(":files:") {
@@ -268,9 +340,10 @@ impl Workspace {
                             "txt"
                         };
                         let name = format!("preview.{extension}");
-                        let patch = similar::TextDiff::configure()
+                        let text_diff = similar::TextDiff::configure()
                             .timeout(Duration::from_millis(20))
-                            .diff_lines(after.as_str(), before.as_str())
+                            .diff_lines(after.as_str(), before.as_str());
+                        let patch = text_diff
                             .unified_diff()
                             .context_radius(3)
                             .header(&name, &name)
@@ -279,9 +352,41 @@ impl Workspace {
                         if files.is_empty() {
                             return None;
                         }
+                        let path = files[0].path().clone();
+                        let hunks = text_diff
+                            .grouped_ops(3)
+                            .into_iter()
+                            .filter_map(|ops| {
+                                let ranges: Vec<_> = ops
+                                    .iter()
+                                    .filter(|op| op.tag() != similar::DiffTag::Equal)
+                                    .flat_map(|op| {
+                                        [
+                                            (DiffSide::Original, op.old_range()),
+                                            (DiffSide::Modified, op.new_range()),
+                                        ]
+                                    })
+                                    .filter(|(_, lines)| !lines.is_empty())
+                                    .map(|(side, lines)| {
+                                        DiffLineRange::new(
+                                            path.clone(),
+                                            side,
+                                            lines.start + 1,
+                                            lines.end,
+                                        )
+                                    })
+                                    .collect();
+                                (!ranges.is_empty()).then_some(ranges)
+                            })
+                            .collect();
                         Some((
                             change.id.clone(),
-                            cx.new(|cx| DiffState::new(files, cx).with_mode(DiffMode::Split)),
+                            ReviewDiff {
+                                state: cx
+                                    .new(|cx| DiffState::new(files, cx).with_mode(DiffMode::Split)),
+                                hunks,
+                                active: 0,
+                            },
                         ))
                     })
                     .collect();
@@ -799,6 +904,70 @@ impl Workspace {
         cx.notify();
     }
 
+    fn active_review_change(&self) -> Option<&Change> {
+        let visible =
+            |change: &&Change| !self.review_pending_only || self.review_needs_decision(change);
+        self.snapshot
+            .changes
+            .iter()
+            .filter(visible)
+            .find(|change| self.review_change_id.as_ref() == Some(&change.id))
+            .or_else(|| self.snapshot.changes.iter().find(visible))
+    }
+
+    fn move_review_hunk(&mut self, id: &str, forward: bool, cx: &mut Context<Self>) {
+        if self.busy.is_some() || self.snapshot.plan_id.is_none() {
+            return;
+        }
+        let Some(diff) = self.review_diffs.get_mut(id) else {
+            return;
+        };
+        if !diff.can_move(forward) {
+            return;
+        }
+        diff.active = if forward {
+            diff.active + 1
+        } else {
+            diff.active - 1
+        };
+        if let Some(range) = diff.hunks[diff.active].first() {
+            let position = DiffLinePosition::new(range.path().clone(), range.side(), range.start());
+            diff.state
+                .update(cx, |state, cx| state.scroll_to_line(position, cx));
+        }
+        cx.notify();
+    }
+
+    fn activate_review_edge(&mut self, id: &str, side: Choice, cx: &mut Context<Self>) {
+        // An implicit default is not a first click. The edge always chooses
+        // before it navigates, and never changes the current review item.
+        if self.choices.get(id) == Some(&side) {
+            self.move_review_hunk(id, side == Choice::Target, cx);
+        } else {
+            self.choose_review_side(id, side, cx);
+        }
+    }
+
+    fn review_keyboard(
+        &mut self,
+        side: Option<Choice>,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let Some(id) = self.active_review_change().map(|change| change.id.clone()) else {
+            return;
+        };
+        if let Some(side) = side {
+            self.choose_review_side(&id, side, cx);
+        } else {
+            self.move_review_hunk(&id, forward, cx);
+        }
+    }
+
     fn select_all_source_changes(&mut self, cx: &mut Context<Self>) {
         if self.busy.is_some() || self.snapshot.plan_id.is_none() {
             return;
@@ -855,6 +1024,19 @@ impl Workspace {
             .unwrap_or_else(|| change.device.clone());
         let whole_file = change.id.contains(":files:") || change.path.starts_with("models.json");
         let diff = self.review_diffs.get(&change.id);
+        let position_label = if let Some(diff) = diff {
+            format!("Hunk {} of {}", diff.active + 1, diff.hunks.len())
+        } else if self
+            .snapshot
+            .text_previews
+            .get(&change.id)
+            .is_some_and(|(before, after)| before == after)
+            || (!whole_file && change.before == change.after)
+        {
+            "No text differences".into()
+        } else {
+            "No navigable text preview".into()
+        };
         let unavailable = self
             .snapshot
             .changes
@@ -862,15 +1044,17 @@ impl Workspace {
             .filter(|change| !change.source_available)
             .count();
         let eligible = self.snapshot.changes.len() - unavailable;
-        let id = change.id.clone();
+        let click_id = change.id.clone();
+        let down_id = change.id.clone();
         let measured_bounds = Rc::new(Cell::new(None::<Bounds<Pixels>>));
         let paint_bounds = measured_bounds.clone();
+        let click_bounds = measured_bounds.clone();
+        let pointer_entity = cx.entity().downgrade();
         let permission_policy = self
             .snapshot
             .file_review_details
             .get(&change.id)
             .is_some_and(|details| details.permission_policy);
-        let click_entity = cx.entity();
         div().flex().flex_col().size_full().min_w_0().min_h_0()
             .child(div().px_4().py_2().border_b_1().border_color(cx.theme().border)
                 .flex().items_center().gap_2()
@@ -882,14 +1066,20 @@ impl Workspace {
                     .child("Permission policy")))
                 .when(!whole_file, |el| el.child(div().text_xs().text_color(cx.theme().muted_foreground).child("Value snippet")))
                 .when(whole_file && diff.is_none(), |el| el.child(div().text_xs().text_color(cx.theme().muted_foreground).child("Safe preview")))
-                .when_some(diff.cloned(), |el, diff| {
-                    let previous = diff.clone();
+                .child(div().id("review-hunk-position").test_support().text_xs().text_color(cx.theme().muted_foreground)
+                    .aria_label(position_label.clone()).child(position_label)
+                    .tooltip(|window, cx| Tooltip::new("Hunks are groups of changed lines within this item. Choose another item in the sidebar.").build(window, cx)))
+                .when_some(diff, |el, diff| {
+                    let previous_id = change.id.clone();
+                    let next_id = change.id.clone();
                     el.child(Button::new("previous-diff-hunk").small().ghost().label("↑")
-                        .accessibility_label("Previous change").tooltip("Previous change")
-                        .on_click(move |_, _, cx| previous.update(cx, |state, cx| state.previous_change(cx))))
+                        .accessibility_label("Previous hunk in this item").tooltip("Previous hunk in this item · Alt+↑")
+                        .disabled(self.busy.is_some() || !diff.can_move(false))
+                        .on_click(cx.listener(move |this, _, _, cx| this.move_review_hunk(&previous_id, false, cx))))
                       .child(Button::new("next-diff-hunk").small().ghost().label("↓")
-                        .accessibility_label("Next change").tooltip("Next change")
-                        .on_click(move |_, _, cx| diff.update(cx, |state, cx| state.next_change(cx))))
+                        .accessibility_label("Next hunk in this item").tooltip("Next hunk in this item · Alt+↓")
+                        .disabled(self.busy.is_some() || !diff.can_move(true))
+                        .on_click(cx.listener(move |this, _, _, cx| this.move_review_hunk(&next_id, true, cx))))
                 })
                 .child(Button::new("use-source-all").small().label("Use source for all changes →")
                     .tooltip(format!("Select source for {eligible} changes. {unavailable} unavailable sources are excluded. Nothing is written until you confirm sync."))
@@ -898,35 +1088,185 @@ impl Workspace {
             .child(div().flex().items_stretch()
                 .child(self.review_column_header(change, Choice::Source, source_name, source.map(|d| d.address.clone()).unwrap_or_default(), destination_name.clone(), cx))
                 .child(self.review_column_header(change, Choice::Target, target_name, target.map(|d| d.address.clone()).unwrap_or_default(), destination_name, cx)))
-            .child(div().id("review-code-surface").relative().flex_1().min_h_0().min_w_0()
-                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-                    if let Some(bounds) = measured_bounds.get() {
-                        let side = if event.position.x < bounds.left() + bounds.size.width / 2. { Choice::Source } else { Choice::Target };
-                        this.hover_review_side("code", Some(side), cx);
-                    }
-                }))
-                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                    if !*hovered { this.hover_review_side("code", None, cx); }
-                }))
-                .child(canvas(move |bounds, _, _| paint_bounds.set(Some(bounds)), |_, _, _, _| {}).absolute().inset_0())
-                .child(if let Some(diff) = diff {
-                Diff::new(diff).size_full().header_visible(false).line_number(true)
-                    .hunk_separator(DiffHunkSeparator::Simple).change_background(true).soft_wrap(true)
-                    .on_line_click(move |position, _, _, cx| {
-                        click_entity.update(cx, |this, cx| this.choose_review_side(&id,
-                            if position.side() == DiffSide::Original { Choice::Source } else { Choice::Target }, cx));
-                    })
-.into_any_element()
-            } else {
-                div().id(SharedString::from(format!("opaque-preview-{}", change.id))).test_support()
-                    .size_full().overflow_y_scroll().child(div().flex().items_stretch().min_h_full()
-                        .child(self.review_opaque_side(change, Choice::Source, change.after.clone(), cx))
-                        .child(self.review_opaque_side(change, Choice::Target, change.before.clone(), cx)))
-                    .into_any_element()
-            }))
+            .child(div().relative().flex().flex_1().min_h_0().min_w_0()
+                .child(div().id("review-code-surface").test_support().relative().flex_1().min_h_0().min_w_0()
+                    .capture_any_mouse_down(cx.listener(move |this, event: &MouseDownEvent, _, _| {
+                        this.review_pointer = Some((down_id.clone(), event.position, false));
+                        // A nested control that claims the press leaves it blocked.
+                        this.review_pointer_blocked = true;
+                    }))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.review_pointer_blocked = gpui_kit::base::GlobalState::is_text_selection_suppressed(cx);
+                    }))
+                    .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                        if let Some(bounds) = measured_bounds.get() {
+                            let side = if event.position.x < bounds.left() + bounds.size.width / 2. { Choice::Source } else { Choice::Target };
+                            this.hover_review_side("code", Some(side), cx);
+                        }
+                    }))
+                    .on_scroll(cx.listener(|this, _, _, _| {
+                        this.review_pointer_blocked = true;
+                    }))
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if !*hovered {
+                            if let Some((_, _, moved)) = &mut this.review_pointer { *moved = true; }
+                            this.hover_review_side("code", None, cx);
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        if !review_content_click(event) { return; }
+                        if matches!(event, ClickEvent::Mouse(_)) && (this.review_pointer_blocked
+                            || !this.review_pointer.as_ref().is_some_and(|(id, _, moved)| id == &click_id && !moved)) { return; }
+                        // Native gutter/text selection is not a version decision.
+                        // Read the current selection rather than retained line metadata,
+                        // which clears asynchronously after a new plain click.
+                        if this.review_diffs.get(&click_id).is_some_and(|diff|
+                            !diff.state.read(cx).selected_text(cx).is_empty()) { return; }
+                        if let Some(bounds) = click_bounds.get() {
+                            let side = if event.position().x < bounds.left() + bounds.size.width / 2. { Choice::Source } else { Choice::Target };
+                            this.choose_review_side(&click_id, side, cx);
+                        }
+                    }))
+                    .child(canvas(move |bounds, _, _| paint_bounds.set(Some(bounds)), move |_, _, window, _| {
+                        // Capture movement across the whole window, including an
+                        // outside-and-back text drag that leaves this pane.
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                            if phase.capture() && event.pressed_button == Some(MouseButton::Left) {
+                                let _ = pointer_entity.update(cx, |this, _| {
+                                    if let Some((_, origin, moved)) = &mut this.review_pointer {
+                                        let delta = event.position - *origin;
+                                        *moved |= delta.x.abs() > px(3.) || delta.y.abs() > px(3.);
+                                    }
+                                });
+                            }
+                        });
+                    }).absolute().inset_0())
+                    .child(if let Some(diff) = diff {
+                        Diff::new(&diff.state).size_full().header_visible(false).line_number(true)
+                            .hunk_separator(DiffHunkSeparator::Simple).change_background(true).soft_wrap(true)
+                            .decorations(diff.hunks.get(diff.active).into_iter().flatten().cloned()
+                                .map(|range| DiffDecoration::new(range).with_background(cx.theme().primary.opacity(0.14))))
+                            .into_any_element()
+                    } else {
+                        div().id(SharedString::from(format!("opaque-preview-{}", change.id))).test_support()
+                            .size_full().overflow_y_scroll().child(div().flex().items_stretch().min_h_full()
+                                .child(self.review_opaque_side(change, Choice::Source, change.after.clone(), cx))
+                                .child(self.review_opaque_side(change, Choice::Target, change.before.clone(), cx)))
+                            .into_any_element()
+                    }))
+                .child(self.review_edge(change, Choice::Source, cx))
+                .child(self.review_edge(change, Choice::Target, cx)))
             .when(!change.source_available, |el| el.child(div().px_4().py_2().border_t_1().border_color(cx.theme().border)
                 .text_xs().text_color(cx.theme().danger)
                 .child("Source unavailable. Choose the target version.")))
+    }
+
+    fn review_edge(
+        &self,
+        change: &Change,
+        side: Choice,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let source = side == Choice::Source;
+        let selected = self.choices.get(&change.id) == Some(&side);
+        let can_move = self
+            .review_diffs
+            .get(&change.id)
+            .is_some_and(|diff| diff.can_move(!source));
+        let action = if selected {
+            if source {
+                "Previous hunk in this item"
+            } else {
+                "Next hunk in this item"
+            }
+        } else if source {
+            "Choose source version first"
+        } else {
+            "Choose target version first"
+        };
+        let label = if selected && !can_move {
+            if self.review_diffs.contains_key(&change.id) {
+                if source {
+                    "First hunk in this item"
+                } else {
+                    "Last hunk in this item"
+                }
+            } else {
+                "No navigable text preview"
+            }
+        } else {
+            action
+        };
+        let id = change.id.clone();
+        let hovered = self.review_hovered_side == Some(side);
+        let hover_owner = if source { "source-edge" } else { "target-edge" };
+        div()
+            .id(if source {
+                "review-source-overlay"
+            } else {
+                "review-target-overlay"
+            })
+            .absolute()
+            .top(relative(0.5))
+            .mt(px(-28.))
+            .w(px(40.))
+            .h(px(56.))
+            .when(source, |el| el.left(px(8.)))
+            // Keep the native vertical scrollbar unobstructed.
+            .when(!source, |el| el.right(px(16.)))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.hover_review_side(hover_owner, (*hovered).then_some(side), cx);
+            }))
+            .child(
+                Button::new(if source {
+                    "review-source-edge"
+                } else {
+                    "review-target-edge"
+                })
+                .custom(
+                    ButtonCustomVariant::new(cx)
+                        .color(cx.theme().background.opacity(0.76))
+                        .foreground(cx.theme().foreground.opacity(0.92))
+                        .hover(cx.theme().muted.opacity(0.82))
+                        .active(cx.theme().muted.opacity(0.94)),
+                )
+                .rounded(px(8.))
+                .border_1()
+                .border_color(cx.theme().border.opacity(0.7))
+                .size_full()
+                .p_0()
+                .opacity(if hovered { 1. } else { 0. })
+                .focus_visible(|style| style.opacity(1.))
+                .child(
+                    Icon::new(if source {
+                        IconName::ChevronLeft
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(px(24.)),
+                )
+                .accessibility_label(label)
+                .tooltip(label)
+                .disabled(
+                    self.busy.is_some()
+                        || (source && !change.source_available)
+                        || (selected && !can_move),
+                )
+                .on_click(cx.listener(move |this, event, _, cx| {
+                    // Edge double-clicks are intentional; dragging the edge is not.
+                    if let ClickEvent::Mouse(mouse) = event {
+                        let delta = mouse.up.position - mouse.down.position;
+                        if delta.x.abs() > px(3.)
+                            || delta.y.abs() > px(3.)
+                            || mouse.down.modifiers != Modifiers::default()
+                            || mouse.up.modifiers != Modifiers::default()
+                        {
+                            return;
+                        }
+                    }
+                    this.activate_review_edge(&id, side, cx);
+                })),
+            )
     }
 
     fn review_column_header(
@@ -1003,7 +1343,7 @@ impl Workspace {
             if selected { ", selected" } else { "" }
         ))
         .tooltip(format!(
-            "{name} · {address}. {action}.{details} Select this header with Tab, then press Enter or Space."
+            "{name} · {address}. {action}.{details} Click the content pane to choose, or use Alt+Left / Alt+Right. Tab then Enter or Space also works."
         ))
         .custom(
             ButtonCustomVariant::new(cx)
@@ -1073,10 +1413,12 @@ impl Workspace {
         content: String,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let id = change.id.clone();
         let disabled = self.busy.is_some() || (side == Choice::Source && !change.source_available);
         div()
-            .id(SharedString::from(format!("opaque-side-{side:?}-{id}")))
+            .id(SharedString::from(format!(
+                "opaque-side-{side:?}-{}",
+                change.id
+            )))
             .flex_1()
             .min_w_0()
             .p_4()
@@ -1095,9 +1437,6 @@ impl Workspace {
                             cx,
                         );
                     }))
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.choose_review_side(&id, side, cx)),
-                    )
             })
             .child(content)
     }
@@ -1228,6 +1567,10 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &PrepareReview, _, cx| this.prepare(cx)))
             .on_action(cx.listener(|this, _: &SelectAllSourceChanges, _, cx| this.select_all_source_changes(cx)))
+            .on_action(cx.listener(|this, _: &ChooseReviewSource, window, cx| this.review_keyboard(Some(Choice::Source), false, window, cx)))
+            .on_action(cx.listener(|this, _: &ChooseReviewTarget, window, cx| this.review_keyboard(Some(Choice::Target), false, window, cx)))
+            .on_action(cx.listener(|this, _: &PreviousReviewHunk, window, cx| this.review_keyboard(None, false, window, cx)))
+            .on_action(cx.listener(|this, _: &NextReviewHunk, window, cx| this.review_keyboard(None, true, window, cx)))
             .on_action(cx.listener(|this, _: &RepeatSelection, _, cx| {
                 if !this.onboarding
                     && this.snapshot.plan_id.is_none()

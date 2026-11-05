@@ -1,5 +1,13 @@
 # Verification record
 
+## Content-pane selection and hunk navigation · 2026-11-05
+
+- `cargo test --locked --workspace`: 56 desktop tests, 25 core tests and the standalone fixture-diagnostic test passed in Linux. The opt-in native-helper and real-SSH tests remained ignored in this run; transport code was not changed.
+- Eight added production-view regressions cover visible hunk position and bounded navigation; select-first outer edges; blank-pane selection; keyboard, busy and unchanged-preview behavior; pure additions/deletions and unavailable/private previews; offscreen navigation and copy-selection preservation; native context expansion; and text/modifier/multiclick, gutter, outside-and-back drag, scrolling and replaced-preview input guards. The overlay regression also checks idle/side-hover visibility, keyboard-focus reveal, select-first activation, boundaries and unchanged content bounds.
+- `node --test backend/tests/*.test.mjs`: all 143 tests passed. Formatting, `git diff --check`, warnings-denied workspace/all-targets/all-features Clippy, and the public-source credential-pattern scan passed.
+- The production GPUI/WGPU renderer was exercised with the synthetic `--fixture-navigation` scenario: one edge click chooses target, the next advances to hunk 2 of 3. The generated native capture was visually inspected. No live device connection or sync was performed.
+- These local checks do not establish Windows/macOS execution, assistive-technology behavior, or real-window manual input. No remote CI run or publication is claimed for the unpushed changes.
+
 ## System OpenSSH migration · 2026-11-05
 
 - `cargo test --locked --workspace`: 25 core and 43 desktop tests passed in the Linux development environment. Coverage includes alias/profile migration, native prompt validation, custom-trust preflight rejection, cancelled-dialog cleanup, and consumed apply approvals.

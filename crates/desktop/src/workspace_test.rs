@@ -895,3 +895,644 @@ fn policy_marker_hashes_and_safe_opaque_previews_remain_discoverable(cx: &mut Te
     })
     .unwrap();
 }
+
+fn click_review_edge(window: &mut gpui_kit::Window, source: bool, cx: &mut gpui_kit::App) {
+    let body = window.find("review-code-surface").bounds();
+    hover_point(
+        window,
+        gpui_kit::point(
+            body.left() + body.size.width * if source { 0.25 } else { 0.75 },
+            body.bottom() - px(20.),
+        ),
+        cx,
+    );
+    window.click(
+        if source {
+            "review-source-edge"
+        } else {
+            "review-target-edge"
+        },
+        cx,
+    );
+}
+
+fn separated_hunks() -> (String, String) {
+    let context = (0..10)
+        .map(|ix| format!("unchanged {ix}\n"))
+        .collect::<String>();
+    (
+        format!("source first\n{context}source middle\n{context}source last\n"),
+        format!("target first\n{context}target middle\n{context}target last\n"),
+    )
+}
+
+#[gpui_kit::test]
+fn review_hunks_have_visible_position_and_bounded_navigation(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    let id = "target:files:three.txt";
+    let (source, target) = separated_hunks();
+    cx.update_window(handle, |_, window, cx| {
+        review_snapshot(
+            &view,
+            vec![review_change(id, "three.txt", true)],
+            vec![(id, &target, &source)],
+            window,
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).review_diffs[id].hunks.len(), 3);
+        assert!(!window.find_all_by_label("Hunk 1 of 3").is_empty());
+        assert_eq!(window.find("previous-diff-hunk").disabled(), Some(true));
+        window.click("next-diff-hunk", cx);
+        assert_eq!(view.read(cx).review_diffs[id].active, 1);
+        assert!(!window.find_all_by_label("Hunk 2 of 3").is_empty());
+        window.click("next-diff-hunk", cx);
+        assert_eq!(view.read(cx).review_diffs[id].active, 2);
+        assert_eq!(window.find("next-diff-hunk").disabled(), Some(true));
+        window.click("next-diff-hunk", cx);
+        assert_eq!(
+            view.read(cx).review_diffs[id].active,
+            2,
+            "last hunk never wraps"
+        );
+        window.click("previous-diff-hunk", cx);
+        assert_eq!(view.read(cx).review_diffs[id].active, 1);
+        assert!(
+            view.read(cx).choices.is_empty(),
+            "hunk navigation never chooses a version"
+        );
+        assert!(
+            view.read(cx).review_change_id.is_none(),
+            "hunks are not sidebar items"
+        );
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn content_blank_space_and_outer_edges_choose_before_navigating(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    let id = "target:files:three.txt";
+    let (source, target) = separated_hunks();
+    cx.update_window(handle, |_, window, cx| {
+        let mut change = review_change(id, "three.txt", true);
+        change.conflict = false; // Default source must not arm the first edge click.
+        review_snapshot(
+            &view,
+            vec![change],
+            vec![(id, &target, &source)],
+            window,
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("next-diff-hunk", cx);
+        click_review_edge(window, true, cx);
+        assert_eq!(view.read(cx).choices[id], Choice::Source);
+        assert_eq!(view.read(cx).review_diffs[id].active, 1);
+        click_review_edge(window, true, cx);
+        assert_eq!(view.read(cx).review_diffs[id].active, 0);
+        click_review_edge(window, false, cx);
+        assert_eq!(view.read(cx).choices[id], Choice::Target);
+        assert_eq!(view.read(cx).review_diffs[id].active, 0);
+        click_review_edge(window, false, cx);
+        assert_eq!(view.read(cx).review_diffs[id].active, 1);
+        let body = window.find("review-code-surface").bounds();
+        click_point(
+            window,
+            gpui_kit::point(
+                body.left() + body.size.width * 0.25,
+                body.bottom() - px(20.),
+            ),
+            cx,
+        );
+        assert_eq!(
+            view.read(cx).choices[id],
+            Choice::Source,
+            "blank source pane chooses source"
+        );
+        click_point(
+            window,
+            gpui_kit::point(
+                body.left() + body.size.width * 0.75,
+                body.bottom() - px(20.),
+            ),
+            cx,
+        );
+        assert_eq!(
+            view.read(cx).choices[id],
+            Choice::Target,
+            "blank target pane chooses target"
+        );
+        assert_eq!(
+            view.read(cx).review_diffs[id].active,
+            1,
+            "ordinary content never navigates"
+        );
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn review_hunk_keyboard_and_unchanged_snapshot_preserve_state(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    let id = "target:files:three.txt";
+    let (source, target) = separated_hunks();
+    cx.update_window(handle, |_, window, cx| {
+        review_snapshot(
+            &view,
+            vec![review_change(id, "three.txt", true)],
+            vec![(id, &target, &source)],
+            window,
+            cx,
+        );
+        window.press("alt-right", cx);
+        assert_eq!(view.read(cx).choices[id], Choice::Target);
+        window.press("alt-down", cx);
+        assert_eq!(view.read(cx).review_diffs[id].active, 1);
+        let original_state = view.read(cx).review_diffs[id].state.clone();
+        review_snapshot(
+            &view,
+            vec![review_change(id, "three.txt", true)],
+            vec![(id, &target, &source)],
+            window,
+            cx,
+        );
+        assert_eq!(view.read(cx).review_diffs[id].active, 1);
+        assert_eq!(view.read(cx).review_diffs[id].state, original_state);
+        window.press("alt-up", cx);
+        assert_eq!(view.read(cx).review_diffs[id].active, 0);
+        window.press("alt-left", cx);
+        assert_eq!(view.read(cx).choices[id], Choice::Source);
+        view.update(cx, |view, _| view.busy = Some("Working".into()));
+        window.render_frame(cx);
+        window.press("alt-down", cx);
+        window.press("alt-right", cx);
+        assert_eq!(view.read(cx).review_diffs[id].active, 0);
+        assert_eq!(view.read(cx).choices[id], Choice::Source);
+        view.update(cx, |view, _| view.busy = None);
+        review_snapshot(
+            &view,
+            vec![review_change(id, "three.txt", true)],
+            vec![(id, "one old\n", "one new\n")],
+            window,
+            cx,
+        );
+        assert_eq!(view.read(cx).review_diffs[id].active, 0);
+        assert_eq!(view.read(cx).review_diffs[id].hunks.len(), 1);
+        assert_ne!(view.read(cx).review_diffs[id].state, original_state);
+        assert_eq!(window.find("previous-diff-hunk").disabled(), Some(true));
+        assert_eq!(window.find("next-diff-hunk").disabled(), Some(true));
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn review_content_selection_gestures_do_not_choose(cx: &mut TestAppContext) {
+    use gpui_kit::{
+        Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput,
+    };
+    let (handle, view, received) = window(cx, true);
+    let id = "target:files:selection.txt";
+    cx.update_window(handle, |_, window, cx| {
+        review_snapshot(
+            &view,
+            vec![review_change(id, "selection.txt", true)],
+            vec![(id, "target content\n", "source content\n")],
+            window,
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let point = window.find_by_label("source content").bounds().center();
+        for (click_count, modifiers) in [
+            (2, Modifiers::default()),
+            (3, Modifiers::default()),
+            (
+                1,
+                Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                1,
+                Modifiers {
+                    control: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    position: point,
+                    button: MouseButton::Left,
+                    click_count,
+                    modifiers,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            window.render_frame(cx);
+            window.dispatch_event(
+                PlatformInput::MouseUp(MouseUpEvent {
+                    position: point,
+                    button: MouseButton::Left,
+                    click_count,
+                    modifiers,
+                }),
+                cx,
+            );
+            window.render_frame(cx);
+            assert!(
+                view.read(cx).choices.is_empty(),
+                "text selection and modifiers must not choose"
+            );
+        }
+        window.dispatch_event(
+            PlatformInput::MouseDown(MouseDownEvent {
+                position: point,
+                button: MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            }),
+            cx,
+        );
+        window.render_frame(cx);
+        for position in [point + gpui_kit::point(px(25.), px(0.)), point] {
+            window.dispatch_event(
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position,
+                    pressed_button: Some(MouseButton::Left),
+                    ..Default::default()
+                }),
+                cx,
+            );
+            window.render_frame(cx);
+        }
+        window.dispatch_event(
+            PlatformInput::MouseUp(MouseUpEvent {
+                position: point,
+                button: MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            }),
+            cx,
+        );
+        window.render_frame(cx);
+        assert!(
+            view.read(cx).choices.is_empty(),
+            "dragging back to the start is still text selection"
+        );
+        let gutter = window.within("old-gutter").find(("line", 0usize)).bounds();
+        click_point(window, gutter.center(), cx);
+        assert!(
+            view.read(cx).choices.is_empty(),
+            "line-number selection is not a version choice"
+        );
+        click_point(window, point, cx);
+        assert_eq!(
+            view.read(cx).choices[id],
+            Choice::Source,
+            "fresh clicks work after selecting text"
+        );
+        view.update(cx, |view, _| view.choices.clear());
+        window.render_frame(cx);
+        let body = window.find("review-code-surface").bounds();
+        let blank = gpui_kit::point(
+            body.left() + body.size.width * 0.25,
+            body.bottom() - px(20.),
+        );
+        window.dispatch_event(
+            PlatformInput::MouseDown(MouseDownEvent {
+                position: blank,
+                button: MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            }),
+            cx,
+        );
+        window.render_frame(cx);
+        for position in [gpui_kit::point(body.left() - px(50.), blank.y), blank] {
+            window.dispatch_event(
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position,
+                    pressed_button: Some(MouseButton::Left),
+                    ..Default::default()
+                }),
+                cx,
+            );
+            window.render_frame(cx);
+        }
+        window.dispatch_event(
+            PlatformInput::MouseUp(MouseUpEvent {
+                position: blank,
+                button: MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            }),
+            cx,
+        );
+        window.render_frame(cx);
+        assert!(
+            view.read(cx).choices.is_empty(),
+            "outside-and-back drag is not a choice"
+        );
+        window.dispatch_event(
+            PlatformInput::MouseDown(MouseDownEvent {
+                position: point,
+                button: MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            }),
+            cx,
+        );
+        window.render_frame(cx);
+        review_snapshot(
+            &view,
+            vec![review_change(id, "selection.txt", true)],
+            vec![(id, "changed target\n", "changed source\n")],
+            window,
+            cx,
+        );
+        window.dispatch_event(
+            PlatformInput::MouseUp(MouseUpEvent {
+                position: point,
+                button: MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            }),
+            cx,
+        );
+        window.render_frame(cx);
+        assert!(
+            view.read(cx).choices.is_empty(),
+            "a replaced preview invalidates an in-flight press"
+        );
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn pure_add_delete_hidden_and_unavailable_previews_are_safe(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    let id = "target:files:empty.txt";
+    cx.update_window(handle, |_, window, cx| {
+        for (source, target, side) in [
+            (
+                "only source\n",
+                "",
+                gpui_kit::component::diff::DiffSide::Original,
+            ),
+            (
+                "",
+                "only target\n",
+                gpui_kit::component::diff::DiffSide::Modified,
+            ),
+        ] {
+            review_snapshot(
+                &view,
+                vec![review_change(id, "empty.txt", true)],
+                vec![(id, target, source)],
+                window,
+                cx,
+            );
+            let diff = &view.read(cx).review_diffs[id];
+            assert_eq!(diff.hunks.len(), 1);
+            assert_eq!(diff.hunks[0][0].side(), side);
+            assert_eq!(window.find("next-diff-hunk").disabled(), Some(true));
+        }
+        review_snapshot(
+            &view,
+            vec![review_change(id, "empty.txt", true)],
+            vec![(id, "same\n", "same\n")],
+            window,
+            cx,
+        );
+        assert!(view.read(cx).review_diffs.is_empty());
+        assert!(window.find_all("next-diff-hunk").is_empty());
+        let private_id = "target:models:/";
+        review_snapshot(
+            &view,
+            vec![review_change(
+                private_id,
+                "models.json · entire private file",
+                false,
+            )],
+            vec![],
+            window,
+            cx,
+        );
+        assert!(view.read(cx).review_diffs.is_empty());
+        assert_eq!(window.find("review-source-edge").disabled(), Some(true));
+        let body = window.find("review-code-surface").bounds();
+        click_point(
+            window,
+            gpui_kit::point(
+                body.left() + body.size.width * 0.25,
+                body.bottom() - px(20.),
+            ),
+            cx,
+        );
+        assert!(!view.read(cx).choices.contains_key(private_id));
+        click_review_edge(window, false, cx);
+        assert_eq!(view.read(cx).choices[private_id], Choice::Target);
+        assert_eq!(window.find("review-target-edge").disabled(), Some(true));
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn navigation_reveals_offscreen_hunks_and_preserves_copy_selection(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+    let (handle, view, received) = window(cx, true);
+    let id = "target:files:long.txt";
+    let context = (0..10)
+        .map(|ix| format!("context {ix}\n"))
+        .collect::<String>();
+    let source = format!(
+        "{}{context}final source hunk\n",
+        (0..90)
+            .map(|ix| format!("source {ix}\n"))
+            .collect::<String>()
+    );
+    let target = format!(
+        "{}{context}final target hunk\n",
+        (0..90)
+            .map(|ix| format!("target {ix}\n"))
+            .collect::<String>()
+    );
+    cx.update_window(handle, |_, window, cx| {
+        review_snapshot(
+            &view,
+            vec![review_change(id, "long.txt", true)],
+            vec![(id, &target, &source)],
+            window,
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find_all_by_label("final source hunk").is_empty());
+        let state = view.read(cx).review_diffs[id].state.clone();
+        state.update(cx, |state, cx| {
+            state.set_selected_lines(
+                Some(DiffLineRange::new("preview.txt", DiffSide::Original, 1, 2)),
+                cx,
+            )
+        });
+        assert_eq!(state.read(cx).selected_text(cx), "source 0\nsource 1\n");
+        view.update(cx, |view, cx| view.move_review_hunk(id, true, cx));
+        window.render_frame(cx);
+        let body = window.find("review-code-surface").bounds();
+        let last = window.find_by_label("final source hunk").bounds();
+        assert!(last.top() >= body.top() && last.bottom() <= body.bottom());
+        assert_eq!(
+            state.read(cx).selected_text(cx),
+            "source 0\nsource 1\n",
+            "highlight never overwrites text selection"
+        );
+        window.click("previous-diff-hunk", cx);
+        let first = window.find_by_label("source 0").bounds();
+        assert!(first.top() >= body.top() && first.bottom() <= body.bottom());
+        assert!(view.read(cx).choices.is_empty());
+        window.scroll(
+            "review-code-surface",
+            gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-160.))),
+            cx,
+        );
+        assert!(
+            view.read(cx).choices.is_empty(),
+            "scrolling does not choose"
+        );
+        let scrollbar = gpui_kit::point(body.right() - px(3.), body.top() + px(30.));
+        hover_point(window, scrollbar, cx);
+        click_point(window, scrollbar, cx);
+        assert!(
+            view.read(cx).choices.is_empty(),
+            "scrollbar click does not choose"
+        );
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn expanding_native_context_does_not_choose_a_version(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    let id = "target:files:fold.txt";
+    cx.update_window(handle, |_, window, cx| {
+        review_snapshot(
+            &view,
+            vec![review_change(id, "fold.txt", true)],
+            vec![(id, "target\none\ntwo\nthree\n", "source\none\ntwo\nthree\n")],
+            window,
+            cx,
+        );
+        let state = view.read(cx).review_diffs[id].state.clone();
+        state.update(cx, |state, cx| state.set_context_lines(Some(0), cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("expand", 1usize), cx);
+        assert!(
+            view.read(cx).choices.is_empty(),
+            "native expand control must not bubble into a choice"
+        );
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn transparent_arrows_follow_pane_hover_and_keyboard_focus_without_layout_shift(
+    cx: &mut TestAppContext,
+) {
+    let (handle, view, received) = window(cx, true);
+    let id = "target:files:overlay.txt";
+    let (source, target) = separated_hunks();
+    cx.update_window(handle, |_, window, cx| {
+        review_snapshot(
+            &view,
+            vec![review_change(id, "overlay.txt", true)],
+            vec![(id, &target, &source)],
+            window,
+            cx,
+        );
+        window.click("next-diff-hunk", cx);
+        hover_point(window, gpui_kit::point(px(100.), px(30.)), cx);
+        assert!(window.find_all("review-interaction-hint").is_empty());
+        let body = window.find("review-code-surface").bounds();
+        assert!(!window.find("review-source-edge").visible());
+        assert!(!window.find("review-target-edge").visible());
+        hover_point(
+            window,
+            gpui_kit::point(
+                body.left() + body.size.width * 0.25,
+                body.bottom() - px(20.),
+            ),
+            cx,
+        );
+        assert!(window.find("review-source-edge").visible());
+        assert!(!window.find("review-target-edge").visible());
+        assert_eq!(window.find("review-code-surface").bounds(), body);
+        hover_point(
+            window,
+            gpui_kit::point(
+                body.left() + body.size.width * 0.75,
+                body.bottom() - px(20.),
+            ),
+            cx,
+        );
+        assert!(!window.find("review-source-edge").visible());
+        assert!(window.find("review-target-edge").visible());
+        assert_eq!(window.find("review-code-surface").bounds(), body);
+        let arrow = window.find("review-target-edge").bounds();
+        assert!(arrow.left() > body.center().x && arrow.right() < body.right());
+        hover_point(window, arrow.center(), cx);
+        assert!(
+            window.find("review-target-edge").visible(),
+            "overlay remains visible while entering it"
+        );
+        hover_point(window, gpui_kit::point(px(100.), px(30.)), cx);
+        for _ in 0..24 {
+            window.press("tab", cx);
+            if window.find("review-source-edge").focused() == Some(true) {
+                break;
+            }
+        }
+        assert_eq!(window.find("review-source-edge").focused(), Some(true));
+        assert!(
+            window.find("review-source-edge").visible(),
+            "keyboard focus reveals the overlay"
+        );
+        window.press("enter", cx);
+        assert_eq!(view.read(cx).choices[id], Choice::Source);
+        assert_eq!(view.read(cx).review_diffs[id].active, 1);
+        window.press("enter", cx);
+        assert_eq!(view.read(cx).review_diffs[id].active, 0);
+        assert_eq!(window.find("review-source-edge").disabled(), Some(true));
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}

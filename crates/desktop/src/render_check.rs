@@ -21,17 +21,54 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "pi-sync-workspace.png".into());
     let (commands, events) = backend::start();
     let mut initial = events.recv_timeout(Duration::from_secs(5))?;
-    let fixture_review = std::env::args().any(|arg| arg == "--fixture-review");
+    let fixture_overlay = std::env::args().find(|arg| {
+        matches!(
+            arg.as_str(),
+            "--fixture-overlay-idle" | "--fixture-overlay-hover" | "--fixture-overlay-selected"
+        )
+    });
+    let fixture_navigation =
+        fixture_overlay.is_some() || std::env::args().any(|arg| arg == "--fixture-navigation");
+    let fixture_review =
+        fixture_navigation || std::env::args().any(|arg| arg == "--fixture-review");
     if fixture_review {
         let ui_model::Event::Snapshot(snapshot) = &mut initial else {
             anyhow::bail!("Missing startup snapshot");
         };
+        snapshot.devices.push(ui_model::Device {
+            id: "example".into(),
+            name: "Example workstation (fixture)".into(),
+            address: "fixture.example.invalid".into(),
+            status: "Synthetic preview".into(),
+            is_local: false,
+            platform: "linux".into(),
+        });
+        snapshot.target_ids = vec!["example".into()];
         snapshot.plan_id = Some("synthetic-render-only".into());
         snapshot.selected_item_ids = vec!["settings".into(), "path:extensions".into()];
         snapshot.changes = vec![
             ui_model::Change { id: "example:settings:/theme".into(), device: "Example workstation (fixture)".into(), path: "settings.json/theme".into(), before: "dark".into(), after: "light".into(), conflict: true, source_available: true },
             ui_model::Change { id: "example:files:extensions/example.ts".into(), device: "Example workstation (fixture)".into(), path: "extensions/example.ts · entire file".into(), before: "No previous file".into(), after: "export const greeting = \"Hello\";\n\nWhole-file copy. Extension code may execute in Pi.\nSynthetic documentation fixture, not user configuration.".into(), conflict: true, source_available: true },
         ];
+    }
+    if fixture_navigation {
+        let ui_model::Event::Snapshot(snapshot) = &mut initial else {
+            unreachable!()
+        };
+        let context = (1..=10)
+            .map(|line| format!("// Unchanged context {line}\n"))
+            .collect::<String>();
+        let source = format!(
+            "export const greeting = \"Hello\";\n{context}export const mode = \"safe\";\n{context}export const retries = 3;\n"
+        );
+        let target = format!(
+            "export const greeting = \"Hi\";\n{context}export const mode = \"review\";\n{context}export const retries = 1;\n"
+        );
+        snapshot.changes[1].before = "Synthetic target preview".into();
+        snapshot.changes[1].after = "Synthetic source preview".into();
+        snapshot
+            .text_previews
+            .insert(snapshot.changes[1].id.clone(), (target, source));
     }
     let mut context = HeadlessAppContext::with_platform(
         gpui_kit::platform::current_platform(true).text_system(),
@@ -76,6 +113,70 @@ fn main() -> anyhow::Result<()> {
     })?;
     // SVG assets are loaded asynchronously. Drain their tasks before capturing
     // a second real frame so device icons are present in the image.
+    context.run_until_parked();
+    context.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        if fixture_navigation {
+            window.click("review-item-example:files:extensions/example.ts", cx);
+            if let Some(state) = &fixture_overlay {
+                window.click("next-diff-hunk", cx);
+                let body = window.find("review-code-surface").bounds();
+                let position = gpui_kit::point(
+                    body.left() + body.size.width * 0.75,
+                    body.bottom() - px(70.),
+                );
+                if state == "--fixture-overlay-selected" {
+                    window.dispatch_event(
+                        gpui_kit::PlatformInput::MouseDown(gpui_kit::MouseDownEvent {
+                            position,
+                            button: gpui_kit::MouseButton::Left,
+                            click_count: 1,
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                    window.render_frame(cx);
+                    window.dispatch_event(
+                        gpui_kit::PlatformInput::MouseUp(gpui_kit::MouseUpEvent {
+                            position,
+                            button: gpui_kit::MouseButton::Left,
+                            click_count: 1,
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                    window.render_frame(cx);
+                }
+                window.dispatch_event(
+                    gpui_kit::PlatformInput::MouseMove(gpui_kit::MouseMoveEvent {
+                        position: if state == "--fixture-overlay-idle" {
+                            gpui_kit::point(px(100.), px(30.))
+                        } else {
+                            position
+                        },
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                window.render_frame(cx);
+            } else {
+                let body = window.find("review-code-surface").bounds();
+                window.dispatch_event(
+                    gpui_kit::PlatformInput::MouseMove(gpui_kit::MouseMoveEvent {
+                        position: gpui_kit::point(
+                            body.left() + body.size.width * 0.75,
+                            body.bottom() - px(70.),
+                        ),
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                window.render_frame(cx);
+                window.click("review-target-edge", cx);
+                window.click("review-target-edge", cx);
+            }
+        }
+    })?;
     context.run_until_parked();
     context.update_window(handle, |_, window, cx| window.render_frame(cx))?;
     let screenshot = context.capture_screenshot(handle)?;

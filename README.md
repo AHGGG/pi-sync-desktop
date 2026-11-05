@@ -24,6 +24,8 @@ On Linux, install the native [GPUI Kit build dependencies](https://gpui-kit.com/
 4. **Review changes** opens a full-window comparison with source/target contents or private-file hashes. File copies and conflicts need an explicit Source, Target or Skip choice. **Cancel review** returns to the remembered selection without writing.
 5. **Confirm sync** summarizes the actual targets and asks for final confirmation. Source and target changes invalidate the review. Connection failures are shown separately from a successful zero-difference result.
 
+In review, click the left or right content pane to choose a version. A translucent arrow overlay appears on the hovered side and when keyboard-focused. After choosing, click its outer edge for the previous (left) or next (right) hunk. The hunk counter and highlight make navigation visible even in a short diff; first/last boundaries do not wrap. Alt+Left/Right chooses a version and Alt+Up/Down navigates hunks. Use the sidebar to switch review items.
+
 **Review saved selection** reads fresh data with one click. It never reuses an old plan or silently applies remembered decisions. Local OS icons and generic SSH-device icons distinguish devices without guessing a remote platform.
 
 Custom paths are relative to each configured Pi directory, not arbitrary absolute source/destination mappings. Folders are recursive; target-only files are never deleted and empty folders are not copied. Transfers allow 256 files, 4 MiB per file and 8 MiB total custom bytes. Symlinks, Git working trees, authentication/credential paths, hidden paths and nonportable names are blocked with an error rather than silently skipped.
