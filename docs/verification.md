@@ -1,5 +1,16 @@
 # Verification record
 
+## Private-model copy update · 2026-11-05
+
+- `node --test backend/tests/*.test.mjs`: 78 tests passed. Coverage includes unknown model schemas and valid JSON roots, exact-byte copies, malformed destination backups, missing/unreadable/invalid source skipping, excluded-file independence, private preview output, and source/target/concurrent-change guards.
+- `cargo test --locked --workspace`: 18 desktop and 9 core tests passed, including the embedded Node invalid-source Skip flow and native review controls.
+- `scripts/test-ssh.sh`: isolated localhost OpenSSH integration passed.
+- `cargo fmt --all -- --check`, warnings-denied workspace/all-targets Clippy, and `node scripts/check-public.mjs` passed.
+
+These checks ran on Linux with Rust 1.99.1 and Node 24.22.1. Existing runtime X11 libraries were used through temporary local linker aliases, with supported `RUST_FONTCONFIG_DLOPEN=1`; no system configuration was changed. This update does not establish real Windows-to-Mac connectivity, provider availability, or new manual native-window coverage. Native CI results must be checked for the exact pushed commit.
+
+## Initial implementation · 2026-11-04
+
 Recorded on 2026-11-04 against this source tree. These results distinguish production code, headless integration, and actual user-platform testing.
 
 ## Passed in the Linux development environment

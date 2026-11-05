@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { handle, validateModels } from '../worker.mjs';
+import { handle, decodeModels } from '../worker.mjs';
 
 const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
 async function fixture(t) {
@@ -133,9 +133,9 @@ test('models are transferred byte-for-byte, backed up privately, and never retur
 
 test('invalid models input is rejected before creating agent directory', async (t) => {
   const { agentDir } = await fixture(t);
-  for (const modelsBase64 of ['$$$', Buffer.from('{"SECRET":').toString('base64'), Buffer.from('[]').toString('base64')]) {
+  for (const modelsBase64 of ['$$$', Buffer.from('{"SECRET":').toString('base64'), Buffer.from([0xff]).toString('base64')]) {
     const result = await handle({ op: 'apply', agentDir, expected: { settings: null, state: null, models: null }, modelsBase64 });
-    assert.equal(result.error.code, 'INVALID_MODELS');
+    assert.match(result.error.code, /^(INVALID_MODELS_ENCODING|INVALID_JSON)$/);
     assert.doesNotMatch(JSON.stringify(result), /SECRET/);
   }
   await assert.rejects(fs.stat(agentDir), { code: 'ENOENT' });
@@ -284,37 +284,28 @@ test('partial failures report applied files and preserve backups without secret 
   } finally { fsDefault.promises.rename = original; syncBuiltinESMExports(); }
 });
 
-test('models require providers objects and valid model identifier arrays', async (t) => {
+test('models accept all JSON roots and unknown provider fields without validating Pi schemas', async (t) => {
   const { agentDir } = await fixture(t);
   await seed(agentDir);
-  for (const value of [{}, { providers: [] }, { providers: { p: null } }, { providers: { p: 'secret' } }, { providers: { p: { models: {} } } }, { providers: { p: { models: [null] } } }, { providers: { p: { models: [{}] } } }, { providers: { p: { models: [{ id: '' }] } } }, { providers: { p: { models: [{ id: '  ' }] } } }, { providers: { p: { models: [{ id: 4 }] } } }]) {
-    const result = await handle({ op: 'apply', agentDir, expected: await expected(agentDir, true), modelsBase64: Buffer.from(JSON.stringify(value)).toString('base64') });
-    assert.equal(result.error.code, 'INVALID_MODELS');
-    assert.equal(result.partial, false);
-    await fs.writeFile(path.join(agentDir, 'models.json'), JSON.stringify(value));
-    assert.equal((await handle({ op: 'snapshot', agentDir, includeModels: true })).error.code, 'INVALID_MODELS');
-    await fs.unlink(path.join(agentDir, 'models.json'));
+  for (const value of [null, [], true, 3, "private", {}, { providers: [] }, { providers: { p: null } }, { providers: { p: { models: {}, futureOption: { unknown: true } } } }]) {
+    const bytes = Buffer.from(JSON.stringify(value));
+    const result = await handle({ op: 'apply', agentDir, expected: await expected(agentDir, true), modelsBase64: bytes.toString('base64') });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.deepEqual(await fs.readFile(path.join(agentDir, 'models.json')), bytes);
+    assert.equal((await handle({ op: 'export-models', agentDir })).modelsBase64, bytes.toString('base64'));
   }
-  await assert.rejects(fs.stat(path.join(agentDir, '.harness-sync')), { code: 'ENOENT' });
 });
 
-test('models replacement cannot invalidate configured defaults or disclose their names', async (t) => {
+test('models replacement preserves configured defaults without requiring registry compatibility', async (t) => {
   const { agentDir } = await fixture(t);
-  const candidate = { providers: { custom: { models: [{ id: 'supported' }] } } };
-  for (const defaults of [
-    {}, { local: true },
-    { defaultProvider: 'custom', defaultModel: 'SECRET_MODEL' },
-    { defaultProvider: 'custom' }, { defaultModel: 'supported' },
-    { defaultProvider: '', defaultModel: '' }, { defaultProvider: null, defaultModel: null },
-  ]) {
+  for (const defaults of [{}, { defaultProvider: 'custom', defaultModel: 'SECRET_MODEL' }, { defaultProvider: 'custom' }, { defaultModel: 'supported' }]) {
     await seed(agentDir, defaults);
-    const result = await handle({ op: 'apply', agentDir, expected: await expected(agentDir, true), modelsBase64: Buffer.from(JSON.stringify(candidate)).toString('base64') });
-    assert.equal(result.error.code, 'DEFAULT_MODEL_UNVERIFIED');
-    assert.equal(result.partial, false);
-    assert.doesNotMatch(JSON.stringify(result), /SECRET_PROVIDER|SECRET_MODEL/);
-    await assert.rejects(fs.stat(path.join(agentDir, '.harness-sync')), { code: 'ENOENT' });
-    await assert.rejects(fs.stat(path.join(agentDir, 'models.json')), { code: 'ENOENT' });
-    assert.deepEqual((await handle({ op: 'snapshot', agentDir })).settings.value, defaults);
+    const before = await fs.readFile(path.join(agentDir, 'settings.json'));
+    const bytes = Buffer.from(JSON.stringify({ providers: {}, future: defaults }));
+    const result = await handle({ op: 'apply', agentDir, expected: await expected(agentDir, true), modelsBase64: bytes.toString('base64') });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.doesNotMatch(JSON.stringify(result), /SECRET_MODEL/);
+    assert.deepEqual(await fs.readFile(path.join(agentDir, 'settings.json')), before);
   }
 });
 
@@ -339,31 +330,8 @@ test('byte-identical models allow a no-op despite unverifiable built-in defaults
   assert.deepEqual(result, { ok: true, applied: [], backupPath: null });
 });
 
-test('recognized models fields enforce Pi schema types and unknown fields fail closed', () => {
-  const badModels = [
-    { contextWindow: 'invalid' }, { contextWindow: 0 }, { maxTokens: -1 },
-    { maxTokens: Infinity }, { reasoning: 'true' }, { name: '' }, { api: 5 },
-    { input: ['audio'] }, { headers: { secret: 123 } }, { cost: { input: 1 } },
-    { cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 'bad' } },
-    { inputLimits: { images: { resize: { jpegQuality: 101 } } } },
-    { inputLimits: { maxRequestBytes: 1.5 } }, { promptCache: { long: 0 } },
-    { thinkingLevelMap: { high: 4 } }, { thinkingLevelMap: { unknown: 'high' } },
-    { samplingParams: [] }, { samplingParamsByThinkingLevel: { high: [] } },
-    { compat: { supportsStore: 'false' } }, { compat: { maxTokensField: 'unknown' } },
-    { compat: { unknown: true } }, { newUnreviewedField: true },
-  ];
-  for (const bad of badModels) assert.throws(() => validateModels({ providers: { p: { models: [{ id: 'm', ...bad }] } } }), /INVALID_MODELS/);
-  for (const bad of [
-    { apiKey: {} }, { apiKey: '' }, { headers: { x: null } }, { authHeader: 'true' },
-    { oauth: 'unknown' }, { modelOverrides: { m: { contextWindow: 'bad' } } },
-    { models: [{ id: 'm' }, { id: 'm' }] }, { unknown: 'field' },
-    { compat: { openRouterRouting: {} } },
-  ]) assert.throws(() => validateModels({ providers: { p: bad } }), /INVALID_MODELS/);
-  assert.throws(() => validateModels({ providers: {}, unknown: true }), /INVALID_MODELS/);
-});
-
 test('supported model options and literal credential references are retained, never resolved', async (t) => {
-  const { root } = await fixture(t);
+  const { root, agentDir } = await fixture(t);
   const marker = path.join(root, 'must-not-exist');
   const config = { $schema: 'https://pi.dev/schemas/models.schema.json', providers: { custom: {
     apiKey: `!touch ${marker}`, baseUrl: 'https://example.invalid', api: 'openai-completions',
@@ -378,7 +346,12 @@ test('supported model options and literal credential references are retained, ne
       samplingParams: { temperature: 0.5 }, samplingParamsByThinkingLevel: { high: { temperature: 0.7 } },
     }],
   } } };
-  assert.equal(validateModels(config), config);
+  const bytes = Buffer.from(JSON.stringify(config));
+  assert.deepEqual(decodeModels(bytes.toString('base64')), bytes);
+  await seed(agentDir);
+  const result = await handle({ op: 'apply', agentDir, expected: await expected(agentDir, true), modelsBase64: bytes.toString('base64') });
+  assert.equal(result.ok, true);
+  assert.deepEqual(await fs.readFile(path.join(agentDir, 'models.json')), bytes);
   assert.equal(config.providers.custom.apiKey, `!touch ${marker}`);
   await assert.rejects(fs.stat(marker), { code: 'ENOENT' });
 });
@@ -425,45 +398,105 @@ for(const documents of [['models'],['state'],['unknown'],['settings',null],'mcp'
   await assert.rejects(fs.stat(agentDir),{code:'ENOENT'});
 });
 
-test('read-only model compatibility check preserves untouched built-in provider without executing Pi', async t => {
- const {agentDir}=await fixture(t);
- await seed(agentDir,{defaultProvider:'builtin',defaultModel:'existing'});
- const result=await handle({op:'check-models',agentDir,expected:await expected(agentDir,true),modelSummary:{providers:{other:{models:[{id:'new'}]}}}});
- assert.equal(result.ok,true);
- await assert.rejects(fs.stat(path.join(agentDir,'.harness-sync')),{code:'ENOENT'});
- await assert.rejects(fs.stat(path.join(agentDir,'models.json')),{code:'ENOENT'});
-});
-test('removal of custom default remains blocked even if it could share a built-in name', async t => {
- const {agentDir}=await fixture(t);
- await seed(agentDir,{defaultProvider:'builtin',defaultModel:'existing'});
- await fs.writeFile(path.join(agentDir,'models.json'),'{"providers":{"builtin":{"models":[{"id":"existing"}]}}}');
- const result=await handle({op:'check-models',agentDir,expected:await expected(agentDir,true),modelSummary:{providers:{}}});
- assert.equal(result.error.code,'DEFAULT_MODEL_UNVERIFIED');
-});
-
-test('check-models rejects full private payloads and credential-bearing summaries', async t => {
- const {agentDir}=await fixture(t);
- await seed(agentDir,{defaultProvider:'builtin',defaultModel:'existing'});
- const exp=await expected(agentDir,true);
- for(const fields of [
-  {modelsBase64:Buffer.from('{"providers":{}}').toString('base64')},
-  {modelSummary:{providers:{custom:{apiKey:'SECRET_KEY',models:[]}}}},
-  {modelSummary:{providers:{custom:{models:[{id:'m',headers:{Authorization:'SECRET_HEADER'}}]}}}},
-  {modelSummary:{providers:{custom:{models:[]}}},settings:{}},
- ]){
-  const result=await handle({op:'check-models',agentDir,expected:exp,...fields});
-  assert.equal(result.ok,false);assert.equal(result.error.code,'INVALID_MODEL_SUMMARY');
-  assert.doesNotMatch(JSON.stringify(result),/SECRET_KEY|SECRET_HEADER/);
- }
- await assert.rejects(fs.stat(path.join(agentDir,'.harness-sync')),{code:'ENOENT'});
-});
-test('optional models snapshot summary exposes only provider names and model IDs', async t => {
+test('model snapshots never expose contents, even if legacy summaries are requested', async t => {
  const {agentDir}=await fixture(t);
  await seed(agentDir);
- await fs.writeFile(path.join(agentDir,'models.json'),JSON.stringify({providers:{custom:{apiKey:'SECRET_KEY',baseUrl:'https://private.invalid',headers:{Authorization:'SECRET_HEADER'},models:[{id:'m',name:'Private label'}]}}}));
+ await fs.writeFile(path.join(agentDir,'models.json'),'{"SECRET_PROVIDER":{"models":"SECRET_MODEL","apiKey":"SECRET_KEY"}}');
  const snapshot=await handle({op:'snapshot',agentDir,includeModels:true,includeModelSummary:true,documents:[]});
  assert.equal(snapshot.ok,true);
- assert.deepEqual(snapshot.models.summary,{providers:{custom:{models:[{id:'m'}]}}});
- assert.equal(snapshot.models.value,undefined);
- assert.doesNotMatch(JSON.stringify(snapshot),/SECRET_KEY|SECRET_HEADER|private.invalid|Private label|apiKey|Authorization/);
+ assert.deepEqual(Object.keys(snapshot).sort(), ['models','ok']);
+ assert.deepEqual(Object.keys(snapshot.models).sort(), ['exists','hash']);
+ assert.doesNotMatch(JSON.stringify(snapshot),/SECRET_|apiKey|models.*value/);
+});
+
+for (const original of ['{ "SECRET":', 'null', '[]', Buffer.from([0xff, 0xfe])]) test(`invalid target models can be backed up and replaced (${String(original)})`, async t => {
+  const {agentDir}=await fixture(t); await seed(agentDir);
+  const bytes=Buffer.from(original);
+  await fs.writeFile(path.join(agentDir,'models.json'),bytes);
+  const replacement=Buffer.from('{ "futureFormat": { "providers": null } }\r\n');
+  const result=await handle({op:'apply',agentDir,expected:await expected(agentDir,true),modelsBase64:replacement.toString('base64')});
+  assert.equal(result.ok,true,JSON.stringify(result));
+  assert.deepEqual(await fs.readFile(path.join(result.backupPath,'models.json')),bytes);
+  assert.deepEqual(await fs.readFile(path.join(agentDir,'models.json')),replacement);
+});
+
+test('invalid source JSON export fails safely, while target snapshot stays opaque', async t => {
+  const {agentDir}=await fixture(t); await seed(agentDir);
+  for(const bytes of [Buffer.from('{"SECRET":'), Buffer.from([0xff])]) {
+    await fs.writeFile(path.join(agentDir,'models.json'),bytes);
+    const result=await handle({op:'export-models',agentDir});
+    assert.equal(result.error.code,'SOURCE_MODELS_INVALID_JSON');
+    assert.doesNotMatch(JSON.stringify(result),/SECRET/);
+    assert.equal((await handle({op:'snapshot',agentDir,documents:[],includeModels:true})).models.hash,sha(bytes));
+  }
+});
+
+test('model reads enforce the size cap again after reading a growing file', async t => {
+  const {agentDir}=await fixture(t); await seed(agentDir);
+  const file=path.join(agentDir,'models.json'); await fs.writeFile(file,'{}');
+  const original=fsDefault.promises.open;
+  fsDefault.promises.open=async (name,...options)=>{
+    const handle=await original(name,...options);
+    if(name===file) handle.readFile=async()=>Buffer.alloc(4*1024*1024+1);
+    return handle;
+  };
+  syncBuiltinESMExports();
+  try {
+    assert.equal((await handle({op:'snapshot',agentDir,documents:[],includeModels:true})).error.code,'FILE_TOO_LARGE');
+    assert.equal((await handle({op:'export-models',agentDir})).error.code,'FILE_TOO_LARGE');
+  } finally { fsDefault.promises.open=original; syncBuiltinESMExports(); }
+});
+
+test('models-only copies do not parse or rewrite unselected settings and baseline', async t => {
+  const {agentDir}=await fixture(t); await seed(agentDir);
+  await fs.writeFile(path.join(agentDir,'settings.json'),'BROKEN_PRIVATE_SETTINGS');
+  await fs.mkdir(path.join(agentDir,'.harness-sync'));
+  await fs.writeFile(path.join(agentDir,'.harness-sync/shared-state.json'),'BROKEN_BASELINE');
+  const snapshot=await handle({op:'snapshot',agentDir,documents:[],includeModels:true});
+  assert.equal(snapshot.ok,true);
+  const result=await handle({op:'apply',agentDir,expected:{models:snapshot.models.hash},modelsBase64:Buffer.from('{}').toString('base64')});
+  assert.equal(result.ok,true,JSON.stringify(result));
+  assert.deepEqual(result.applied.map(a=>a.file),['models']);
+  assert.equal(await fs.readFile(path.join(agentDir,'settings.json'),'utf8'),'BROKEN_PRIVATE_SETTINGS');
+  assert.equal(await fs.readFile(path.join(agentDir,'.harness-sync/shared-state.json'),'utf8'),'BROKEN_BASELINE');
+});
+
+test('unreadable target models fail before writes or backups with a safe actionable code', async t => {
+  const {agentDir}=await fixture(t); await seed(agentDir);
+  const file=path.join(agentDir,'models.json'); await fs.writeFile(file,'old bytes');
+  const exp=await expected(agentDir,true);
+  const original=fsDefault.promises.open;
+  fsDefault.promises.open=async (name,...options)=>{
+    if(name===file) { const error=new Error('PRIVATE_PATH_CONTENTS'); error.code='EACCES'; throw error; }
+    return original(name,...options);
+  };
+  syncBuiltinESMExports();
+  try {
+    const result=await handle({op:'apply',agentDir,expected:exp,settings:{changed:true},modelsBase64:Buffer.from('{}').toString('base64')});
+    assert.equal(result.error.code,'TARGET_MODELS_UNREADABLE');
+    assert.deepEqual(result.applied,[]);
+    assert.doesNotMatch(JSON.stringify(result),/PRIVATE_PATH_CONTENTS/);
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(agentDir,'settings.json'))),{device:'keep'});
+    await assert.rejects(fs.stat(path.join(agentDir,'.harness-sync')),{code:'ENOENT'});
+  } finally { fsDefault.promises.open=original; syncBuiltinESMExports(); }
+});
+
+test('concurrent malformed target model edits immediately before replacement are not overwritten', async t => {
+  const {agentDir}=await fixture(t); await seed(agentDir);
+  const file=path.join(agentDir,'models.json'); await fs.writeFile(file,'old malformed bytes');
+  const snapshot=await handle({op:'snapshot',agentDir,documents:[],includeModels:true});
+  const original=fsDefault.promises.open;
+  fsDefault.promises.open=async (name,...options)=>{
+    const handle=await original(name,...options);
+    if(name.endsWith('.tmp')) await fs.writeFile(file,'concurrent malformed bytes');
+    return handle;
+  };
+  syncBuiltinESMExports();
+  try {
+    const result=await handle({op:'apply',agentDir,expected:{models:snapshot.models.hash},modelsBase64:Buffer.from('{}').toString('base64')});
+    assert.equal(result.error.code,'CONCURRENT_UPDATE');
+    assert.deepEqual(result.applied,[]);
+    assert.equal(await fs.readFile(file,'utf8'),'concurrent malformed bytes');
+    assert.equal(await fs.readFile(path.join(result.backupPath,'models.json'),'utf8'),'old malformed bytes');
+  } finally { fsDefault.promises.open=original; syncBuiltinESMExports(); }
 });

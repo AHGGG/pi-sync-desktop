@@ -54,111 +54,30 @@ async function safeLocation(request) {
   return dir;
 }
 
-function parseObject(bytes) {
+function parseJson(bytes) {
   if (bytes.length > MAX_BYTES) fail('FILE_TOO_LARGE');
   let value;
   try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); }
   catch { fail('INVALID_JSON'); }
+  return value;
+}
+
+function parseObject(bytes) {
+  const value = parseJson(bytes);
   if (!object(value)) fail('INVALID_JSON_OBJECT');
   return value;
 }
 
-// Dependency-free, fail-closed subset of Pi's model-config/model-schema definitions.
-// Unknown fields (including unsupported complex compat routing) require review, not copying.
-const nonempty = (v) => typeof v === 'string' && v.trim().length > 0;
-const number = (v) => typeof v === 'number' && Number.isFinite(v);
-const positive = (v) => number(v) && v > 0;
-const integer = (v) => positive(v) && Number.isInteger(v);
-const boolean = (v) => typeof v === 'boolean';
-const string = (v) => typeof v === 'string';
-const choices = (...values) => (v) => values.includes(v);
-const record = (test) => (v) => object(v) && Object.values(v).every(test);
-const array = (test) => (v) => Array.isArray(v) && v.every(test);
-const shape = (fields, required = []) => (v) => object(v)
-  && required.every((key) => own(v, key))
-  && Object.entries(v).every(([key, value]) => own(fields, key) && fields[key](value));
-const levels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
-const levelMap = (test) => shape(Object.fromEntries(levels.map((key) => [key, test])));
-const rates = { input: number, output: number, cacheRead: number, cacheWrite: number };
-const cost = (partial = false) => shape({ ...rates, tiers: array(shape({ ...rates, inputTokensAbove: number }, [...Object.keys(rates), 'inputTokensAbove'])) }, partial ? [] : Object.keys(rates));
-const inputLimits = shape({
-  maxRequestBytes: integer,
-  images: shape({ maxPerMessage: integer, maxPerRequest: integer, resize: shape({
-    maxWidth: integer, maxHeight: integer, maxBytes: integer,
-    jpegQuality: (v) => integer(v) && v <= 100,
-  }) }),
-});
-const compatBooleans = [
-  'supportsStore', 'supportsDeveloperRole', 'supportsReasoningEffort', 'supportsUsageInStreaming',
-  'supportsFinishReason', 'requiresToolResultName', 'requiresAssistantAfterToolResult',
-  'requiresThinkingAsText', 'requiresReasoningContentOnAssistantMessages', 'zaiToolStream',
-  'supportsThinkingTokenBudget', 'supportsOpenAIGrammarTools', 'supportsMidConvoSystemMessages',
-  'supportsMidConvoToolAdditions', 'supportsStrictMode', 'sendSessionAffinityHeaders',
-  'supportsLongCacheRetention', 'supportsAdditionalTools', 'supportsToolSearch',
-  'supportsExplicitPromptCacheMode', 'supportsMidConvoEffort', 'supportsMaxOutputTokens',
-  'supportsEagerToolInputStreaming', 'supportsCacheControlOnTools', 'supportsTemperature',
-  'forceAdaptiveThinking', 'allowEmptySignature', 'supportsStrictTools', 'supportsMidConvoToolChanges',
-];
-const compat = shape({
-  ...Object.fromEntries(compatBooleans.map((key) => [key, boolean])),
-  maxTokensField: choices('max_completion_tokens', 'max_tokens'),
-  sessionAffinityFormat: choices('openai', 'openai-nosession', 'openrouter'),
-  thinkingTokenBudgetField: choices('thinking_token_budget', 'thinking_budget', 'thinking_budget_tokens'),
-  thinkingFormat: choices('openai', 'openrouter', 'deepseek', 'together', 'baseten', 'zai', 'qwen', 'chat-template', 'qwen-chat-template', 'string-thinking', 'ant-ling'),
-  cacheControlFormat: choices('anthropic'),
-  vllmPriority: number,
-});
-const modelFields = {
-  name: nonempty, reasoning: boolean, headers: record(string), compat,
-  thinkingLevelMap: levelMap((v) => v === null || string(v)),
-  input: array(choices('text', 'image')), inputLimits,
-  cost: cost(), promptCache: shape({ short: positive, long: positive }),
-  contextWindow: positive, maxTokens: positive,
-  samplingParams: object, samplingParamsByThinkingLevel: levelMap(object),
-};
-const modelDefinition = shape({ ...modelFields, id: nonempty, api: nonempty, baseUrl: nonempty }, ['id']);
-const modelOverride = shape({ ...modelFields, cost: cost(true) });
-const providerDefinition = shape({
-  name: nonempty, baseUrl: nonempty, apiKey: nonempty, api: nonempty,
-  oauth: choices('radius'), headers: record(string), compat, authHeader: boolean,
-  models: (v) => array(modelDefinition)(v) && new Set(v.map((model) => model.id)).size === v.length,
-  modelOverrides: record(modelOverride),
-});
-
-export function validateModels(value) {
-  if (!shape({ $schema: string, providers: record(providerDefinition) }, ['providers'])(value)) fail('INVALID_MODELS');
-  return value;
+// Models are private configuration bytes, not a schema this sync tool owns.
+// Validate only readable UTF-8 JSON; Pi remains responsible for its runtime semantics.
+export function decodeModels(encoded) {
+  if (typeof encoded !== 'string' || encoded.length > Math.ceil(MAX_BYTES / 3) * 4 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) fail('INVALID_MODELS_ENCODING');
+  const bytes = Buffer.from(encoded, 'base64');
+  parseJson(bytes);
+  return bytes;
 }
 
-// Only compatibility metadata may leave the source during destination preview.
-export function summarizeModels(value) {
-  return { providers: Object.fromEntries(Object.entries(value?.providers ?? {}).map(([name, provider]) => [name, {
-    models: (provider.models ?? []).map(model => ({ id: model.id })),
-  }])) };
-}
-function validateModelSummary(value) {
-  if (!shape({ providers: record(shape({ models: array(shape({ id: nonempty }, ['id'])) }, ['models'])) }, ['providers'])(value)) fail('INVALID_MODEL_SUMMARY');
-  return value;
-}
-
-export function assertDefaultCompatible(models, settings, previousModels) {
-  if (!settings || (!own(settings, 'defaultProvider') && !own(settings, 'defaultModel'))) fail('DEFAULT_MODEL_UNVERIFIED');
-  const provider = settings.defaultProvider;
-  const model = settings.defaultModel;
-  // If neither custom file touches this provider, this replacement cannot affect its
-  // built-in/extension registry. Preserve the existing selection without executing Pi.
-  // This proves non-interference, not runtime availability or credential validity.
-  if (typeof provider === 'string' && provider.trim() && typeof model === 'string' && model.trim()
-    && previousModels !== undefined && !own(models.providers, provider)
-    && !own(previousModels?.providers ?? {}, provider)) return;
-  // Changed custom providers must explicitly retain the configured default model.
-  if (typeof provider !== 'string' || !provider.trim() || typeof model !== 'string' || !model.trim()
-    || !own(models.providers, provider) || !models.providers[provider].models?.some((entry) => entry.id === model)) {
-    fail('DEFAULT_MODEL_UNVERIFIED');
-  }
-}
-
-async function read(file) {
+async function read(file, raw = false) {
   await inspectPath(file);
   let handle;
   try {
@@ -167,7 +86,8 @@ async function read(file) {
     if (!s.isFile()) fail('NOT_REGULAR_FILE');
     if (s.size > MAX_BYTES) fail('FILE_TOO_LARGE');
     const bytes = await handle.readFile();
-    const value = parseObject(bytes);
+    if (bytes.length > MAX_BYTES) fail('FILE_TOO_LARGE');
+    const value = raw ? undefined : parseObject(bytes);
     return { exists: true, hash: digest(bytes), value, bytes };
   } catch (e) {
     if (missing(e)) return { exists: false, hash: null, value: null, bytes: null };
@@ -213,42 +133,42 @@ export async function handle(request) {
   let lock;
   const temps = new Set();
   try {
-    if (!object(request) || !['snapshot', 'export-models', 'check-models', 'apply'].includes(request.op)) fail('INVALID_REQUEST');
+    if (!object(request) || !['snapshot', 'export-models', 'apply'].includes(request.op)) fail('INVALID_REQUEST');
     const dir = await safeLocation(request);
     const meta = path.join(dir, '.harness-sync');
     const files = { settings: path.join(dir, 'settings.json'), state: path.join(meta, 'shared-state.json'), models: path.join(dir, 'models.json'), mcp: path.join(dir, 'mcp.json'), subagents: path.join(dir, 'subagents.json') };
     if (request.op === 'export-models') {
-      const record = await read(files.models);
+      const record = await read(files.models, true);
       if (!record.exists) fail('SOURCE_MODELS_MISSING');
-      validateModels(record.value);
+      try { parseJson(record.bytes); } catch (e) {
+        if (e.workerCode === 'INVALID_JSON') fail('SOURCE_MODELS_INVALID_JSON');
+        throw e;
+      }
       return { ok: true, hash: record.hash, modelsBase64: record.bytes.toString('base64') };
     }
-    const includeModels = request.op === 'check-models' || request.includeModels === true || own(request, 'modelsBase64') || (object(request.expected) && own(request.expected, 'models'));
+    const includeModels = request.includeModels === true || own(request, 'modelsBase64') || (object(request.expected) && own(request.expected, 'models'));
     if (request.documents !== undefined && (!Array.isArray(request.documents) || request.documents.some(k => !['settings', 'mcp', 'subagents'].includes(k)))) fail('INVALID_DOCUMENT_SELECTION');
     const optional = ['mcp', 'subagents'].filter((k) => (request.op === 'snapshot' && (request.documents === undefined || request.documents.includes(k))) || own(request, k) || (object(request.expected) && own(request.expected, k)));
-    const keys = ['settings', 'state', ...optional, ...(includeModels ? ['models'] : [])];
+    const includeDocuments = request.op === 'snapshot'
+      ? request.documents === undefined || request.documents.length > 0
+      : ['settings', 'state', 'mcp', 'subagents'].some(k => own(request, k) || (object(request.expected) && own(request.expected, k)));
+    const keys = [...(includeDocuments ? ['settings', 'state'] : []), ...optional, ...(includeModels ? ['models'] : [])];
     const readAll = async () => Object.fromEntries(await Promise.all(keys.map(async (key) => {
-      const record = await read(files[key]);
-      if (key === 'models' && record.exists) validateModels(record.value);
-      return [key, record];
+      try { return [key, await read(files[key], key === 'models')]; }
+      catch (e) {
+        if (key === 'models' && !e.workerCode) fail('TARGET_MODELS_UNREADABLE');
+        throw e;
+      }
     })));
     let previous = await readAll();
     if (request.op === 'snapshot') {
       const snapshot = { ok: true, ...Object.fromEntries(keys.map((k) => [k, publicRecord(!previous[k].exists && ['mcp', 'subagents'].includes(k) ? { ...previous[k], value: {} } : previous[k], k !== 'models')])) };
-      if (includeModels && request.includeModelSummary === true) snapshot.models.summary = summarizeModels(previous.models.value);
       return snapshot;
     }
     const writes = {};
-    let candidateModels;
-    if (request.op === 'check-models') {
-      if (['modelsBase64', 'settings', 'state', 'mcp', 'subagents'].some(key => own(request, key))) fail('INVALID_MODEL_SUMMARY');
-      candidateModels = validateModelSummary(request.modelSummary);
-    }
     for (const key of ['settings', 'state', 'mcp', 'subagents']) if (own(request, key)) writes[key] = encode(request[key]);
     if (own(request, 'modelsBase64')) {
-      if (typeof request.modelsBase64 !== 'string' || request.modelsBase64.length > Math.ceil(MAX_BYTES / 3) * 4 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(request.modelsBase64)) fail('INVALID_MODELS');
-      const bytes = Buffer.from(request.modelsBase64, 'base64');
-      try { candidateModels = validateModels(parseObject(bytes)); } catch { fail('INVALID_MODELS'); }
+      const bytes = decodeModels(request.modelsBase64);
       writes.models = bytes;
     }
     if (!object(request.expected)) fail('EXPECTED_HASH_REQUIRED');
@@ -259,11 +179,6 @@ export async function handle(request) {
       }
     };
     checkExpected(previous);
-    if (candidateModels && (request.op === 'check-models' || digest(writes.models) !== previous.models.hash)) {
-      assertDefaultCompatible(candidateModels, previous.settings.value, previous.models.value);
-      if (own(writes, 'settings')) assertDefaultCompatible(candidateModels, request.settings, previous.models.value);
-    }
-    if (request.op === 'check-models') return { ok: true };
     await privateDirs(meta);
     const lockPath = path.join(meta, 'lock');
     await inspectPath(lockPath, true);
@@ -295,19 +210,18 @@ export async function handle(request) {
       await exclusiveWrite(tmp, writes[k]);
       await safeLocation(request);
       // This narrows but cannot eliminate races with Pi or other non-cooperating writers.
-      if (k === 'models') {
+      if (k === 'models' && previous.settings) {
         const settingsNow = await read(files.settings);
         const settingsHash = own(writes, 'settings') ? digest(writes.settings) : previous.settings.hash;
         if (settingsNow.hash !== settingsHash) fail('CONCURRENT_UPDATE');
-        assertDefaultCompatible(candidateModels, settingsNow.value, previous.models.value);
       }
-      const current = await read(files[k]);
+      const current = await read(files[k], k === 'models');
       if (current.hash !== previous[k].hash) fail('CONCURRENT_UPDATE');
       await fs.rename(tmp, files[k]);
       temps.delete(tmp);
       const result = { file: k, hash: digest(writes[k]), backupPath: previous[k].exists ? path.join(backupPath, `${k}.json`) : null, verified: false };
       applied.push(result);
-      const verified = await read(files[k]);
+      const verified = await read(files[k], k === 'models');
       if (verified.hash !== result.hash) fail('VERIFY_FAILED');
       result.verified = true;
     }
@@ -331,7 +245,7 @@ export async function handle(request) {
     }
     return { ok: true, applied, backupPath, atomic: false };
   } catch (e) {
-    return { ok: false, error: { code: e.workerCode ?? 'IO_ERROR' }, applied, ...(backupPath ? { backupPath } : {}), partial: applied.length > 0 };
+    return { ok: false, error: { code: e.workerCode ?? ({ EACCES: 'PERMISSION_DENIED', EPERM: 'PERMISSION_DENIED', ENOSPC: 'DISK_FULL', EROFS: 'READ_ONLY_FILESYSTEM' })[e.code] ?? 'IO_ERROR' }, applied, ...(backupPath ? { backupPath } : {}), partial: applied.length > 0 };
   } finally {
     for (const tmp of temps) await fs.unlink(tmp).catch(() => {});
     if (lock) await fs.rmdir(lock).catch(() => {});

@@ -29,4 +29,4 @@ Design and coding follow the requested [GPUI Kit skills](https://github.com/long
 
 ## Deliberate limits
 
-Categories can be staged, with per-setting choices during review. Arbitrary unknown settings, arbitrary MCP servers, and permission-policy edits are not silently generalized beyond the audited schema. Model compatibility checks prove preservation/non-interference, not actual provider connectivity. Packaging, signing, live-device interoperability and assistive-technology validation need real platform evidence.
+Categories can be staged, with per-setting choices during review. Arbitrary unknown settings, arbitrary MCP servers, and permission-policy edits are not silently generalized beyond the audited schema. Models are private files copied byte-for-byte after review, not interpreted as a fixed Pi schema. Review shows replacement, hidden contents, backup and unchanged-default notices. Runtime compatibility and provider connectivity belong to Pi. Unreadable or invalid source models can be skipped independently of other settings. Packaging, signing, live-device interoperability and assistive-technology validation need real platform evidence.

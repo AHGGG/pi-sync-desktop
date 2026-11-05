@@ -259,7 +259,7 @@ impl Backend {
             ConfigItem { id: "mcp".into(), name: "MCP configuration".into(), category: "Optional".into(), detail: "Reviewed server fields. Never enabled by selecting settings alone.".into() },
         ];
         if self.snapshot.source_id.as_deref() != Some(PUBLIC_ID) {
-            self.snapshot.items.push(ConfigItem { id: "models".into(), name: "Private model definitions".into(), category: "Private · device to device".into(), detail: "Replace after review. Credentials stay private; unresolved default compatibility blocks apply.".into() });
+            self.snapshot.items.push(ConfigItem { id: "models".into(), name: "Private model definitions".into(), category: "Private · device to device".into(), detail: "Copy the entire models.json file. Private values stay hidden; the previous file is backed up.".into() });
         }
         self.snapshot.has_last_selection = self.last.is_some();
         let _ = self.events.send(Event::Snapshot(self.snapshot.clone()));
@@ -475,6 +475,7 @@ impl Backend {
                                     before: display_value(before),
                                     after: display_value(after),
                                     conflict: is_conflict,
+                                    source_available: true,
                                 });
                                 self.changes
                                     .insert(change_id, (id.clone(), document.clone(), path.into()));
@@ -489,15 +490,16 @@ impl Backend {
                     id: change_id.clone(),
                     device: name,
                     path: "models.json · entire private file".into(),
-                    before: model_preview(
-                        &target["models"]["targetSummary"],
-                        target["models"]["targetHash"].as_str().unwrap_or("missing"),
+                    before: model_target_preview(
+                        target["models"]["targetHash"].as_str(),
+                        target["models"]["targetInspected"] == true,
                     ),
-                    after: model_preview(
-                        &target["models"]["sourceSummary"],
-                        target["models"]["sourceHash"].as_str().unwrap_or("unknown"),
+                    after: model_source_preview(
+                        target["models"]["sourceHash"].as_str(),
+                        target["models"]["error"].as_str(),
                     ),
                     conflict: target["models"]["error"].is_string(),
+                    source_available: !target["models"]["error"].is_string(),
                 });
                 if let Some(error) = target["models"]["error"].as_str() {
                     self.snapshot.results.push((
@@ -526,12 +528,8 @@ impl Backend {
             "The preview is no longer current. Prepare it again"
         );
         ensure!(
-            self.snapshot
-                .changes
-                .iter()
-                .filter(|c| c.conflict)
-                .all(|c| choices.contains_key(&c.id)),
-            "Choose source, target or skip for every conflict"
+            self.snapshot.unresolved_count(&choices) == 0,
+            "Choose Target or Skip for unavailable source files and resolve the remaining conflicts"
         );
         ensure!(
             choices.keys().all(|id| self.changes.contains_key(id)),
@@ -775,36 +773,30 @@ impl Backend {
 fn local_root() -> String {
     std::env::var("PI_CODING_AGENT_DIR").unwrap_or_else(|_| "~/.pi/agent".into())
 }
-fn model_preview(summary: &Value, hash: &str) -> String {
-    let mut rows = vec![format!("SHA256 {hash}")];
-    if let Some(providers) = summary["providers"].as_object() {
-        if providers.is_empty() {
-            rows.push("No custom providers".into());
-        }
-        for (name, provider) in providers {
-            let models = provider["models"]
-                .as_array()
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(|v| v["id"].as_str())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            rows.push(format!(
-                "{name}: {}",
-                if models.is_empty() {
-                    "provider configuration; no explicit models".into()
-                } else {
-                    models.join(", ")
-                }
-            ));
-        }
-    } else {
-        rows.push("No previous model file".into());
+fn model_target_preview(hash: Option<&str>, inspected: bool) -> String {
+    if !inspected {
+        return "Destination models.json is unchanged. It was not inspected because the source file is unavailable.".into();
     }
-    rows.push("Credentials, endpoints and other private details are hidden. The entire file is replaced if you choose Source.".into());
-    rows.join("\n")
+    match hash {
+        Some(hash) => format!(
+            "Private values hidden.\nSHA256 {hash}\nThe previous file will be backed up before replacement."
+        ),
+        None => "No previous models.json file. Choosing Source creates it.".into(),
+    }
+}
+fn model_source_preview(hash: Option<&str>, error: Option<&str>) -> String {
+    if let Some(error) = error {
+        return format!(
+            "{}\nChoose Target or Skip to continue with other settings. Choosing Source remains blocked. Private values hidden.",
+            explain(error)
+        );
+    }
+    let fingerprint = hash
+        .map(|hash| format!("\nSHA256 {hash}"))
+        .unwrap_or_default();
+    format!(
+        "Copy the entire source models.json file. Private values hidden.{fingerprint}\nChoosing Source replaces the destination file, not individual models. Default provider/model settings stay unchanged; you may need to select a model in Pi after replacement. Provider availability is not tested."
+    )
 }
 fn display_value(value: &Value) -> String {
     if value["present"] == false {
@@ -817,17 +809,52 @@ fn display_value(value: &Value) -> String {
 }
 fn explain(code: &str) -> String {
     match code {
-        "DEFAULT_MODEL_UNVERIFIED" => "Blocked: the target default model cannot be verified in the selected models. Defaults were preserved",
+        "SOURCE_MODELS_INVALID_JSON" => {
+            "The source models.json is not valid JSON and cannot be copied"
+        }
+        "SOURCE_MODELS_UNREADABLE" => {
+            "The source models.json cannot be read. Check its file permissions or skip it"
+        }
+        "SOURCE_MODELS_MISSING" => "The source has no models.json file to copy",
+        "SOURCE_MODELS_SYMLINK_REJECTED" => {
+            "The source models.json is a symbolic link and cannot be copied safely"
+        }
+        "SOURCE_MODELS_NOT_REGULAR_FILE" => {
+            "The source models.json is not a regular file and cannot be copied safely"
+        }
+        "SOURCE_MODELS_TOO_LARGE" => "The source models.json exceeds the safe file size limit",
+        "TARGET_MODELS_UNREADABLE" => {
+            "The destination models.json cannot be read for a backup. Check its file permissions"
+        }
+        "PERMISSION_DENIED" => "A file could not be read or written. Check permissions for the configuration and backup folders",
+        "DISK_FULL" => "The destination ran out of space. Free space, inspect any applied files, then preview again",
+        "READ_ONLY_FILESYSTEM" => "The destination is read-only. Choose a writable configuration folder",
+        "IO_ERROR" => "A file operation failed. Check the device connection, available disk space, and configuration folder access",
         "SOURCE_CHANGED" => "The source changed after review. Prepare a fresh preview",
-        "STALE_PLAN" | "STALE_TARGET" | "TARGET_CHANGED" | "STALE_SNAPSHOT" => "The target changed after review. Prepare a fresh preview",
+        "STALE_PLAN" | "STALE_TARGET" | "TARGET_CHANGED" | "STALE_SNAPSHOT" => {
+            "The target changed after review. Prepare a fresh preview"
+        }
         "PUBLIC_MODELS_FORBIDDEN" => "Private models require a device source",
-        "SSH_FAILED" => "Connection or authentication failed; this device was not confirmed updated",
+        "SSH_FAILED" => {
+            "Connection or authentication failed; this device was not confirmed updated"
+        }
         "PLAN_NOT_FOUND" | "PLAN_EXPIRED" => "This preview expired. Prepare it again",
         "SYMLINK_REJECTED" => "A configuration path is a symbolic link. Sync is blocked for safety",
-        "REPOSITORY_TARGET" => "Private device configuration cannot be written inside a Git repository",
-        "PUBLIC_FETCH_FAILED" | "PUBLIC_SOURCE_UNAVAILABLE" => "Cannot fetch the public harness. Check the connection and try again",
+        "NOT_REGULAR_FILE" => {
+            "A configuration path is not a regular file. Sync is blocked for safety"
+        }
+        "FILE_TOO_LARGE" => {
+            "A configuration file exceeds the safe file size limit. Sync is blocked"
+        }
+        "REPOSITORY_TARGET" => {
+            "Private device configuration cannot be written inside a Git repository"
+        }
+        "PUBLIC_FETCH_FAILED" | "PUBLIC_SOURCE_UNAVAILABLE" => {
+            "Cannot fetch the public harness. Check the connection and try again"
+        }
         _ => return format!("Sync blocked: {code}"),
-    }.into()
+    }
+    .into()
 }
 fn read_selection(path: &Path) -> Result<Option<Selection>> {
     let metadata = match fs::symlink_metadata(path) {
@@ -937,11 +964,88 @@ mod tests {
         assert_eq!(replay["error"]["code"], "PLAN_NOT_FOUND");
     }
     #[test]
-    fn model_review_displays_only_provider_names_and_ids() {
-        let summary = json!({"providers":{"custom":{"apiKey":"DO_NOT_DISPLAY","models":[{"id":"model-a","name":"PRIVATE_LABEL"}]}}});
-        let review = model_preview(&summary, "hash");
-        assert!(review.contains("custom: model-a"));
-        assert!(!review.contains("DO_NOT_DISPLAY"));
-        assert!(!review.contains("PRIVATE_LABEL"));
+    fn embedded_bridge_skips_invalid_models_and_applies_settings() {
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "macos")]
+        let root_path = fs::canonicalize(root.path()).unwrap();
+        #[cfg(not(target_os = "macos"))]
+        let root_path = root.path().to_path_buf();
+        let source = root_path.join("source");
+        let target = root_path.join("target");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(source.join("settings.json"), r#"{"theme":"light"}"#).unwrap();
+        fs::write(source.join("models.json"), "not json").unwrap();
+        fs::write(target.join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        fs::write(target.join("models.json"), "keep these exact bytes").unwrap();
+        let mut engine = Engine::spawn().unwrap();
+        let preview = exchange(
+            &mut engine,
+            json!({"id":1,"op":"preview","source":{"id":"source","type":"local","agentDir":source},"targets":[{"id":"target","type":"local","agentDir":target}],"items":["settings","models"]}),
+        );
+        assert_eq!(preview["ok"], true, "fixture preview failed: {preview}");
+        assert_eq!(preview["targets"][0]["status"], "conflicts");
+        assert_eq!(
+            preview["targets"][0]["models"]["error"],
+            "SOURCE_MODELS_INVALID_JSON"
+        );
+        let resolved = exchange(
+            &mut engine,
+            json!({"id":2,"op":"resolve","planId":preview["planId"],"resolutions":{"target":{"settings":{"/theme":"source"}}},"modelChoices":{"target":"skip"}}),
+        );
+        assert_eq!(resolved["targets"][0]["status"], "ready");
+        assert_eq!(resolved["targets"][0]["models"]["changed"], false);
+        let applied = exchange(
+            &mut engine,
+            json!({"id":3,"op":"apply","planId":resolved["planId"],"approved":true,"targetIds":["target"]}),
+        );
+        assert_eq!(applied["targets"][0]["status"], "applied");
+        let saved: Value =
+            serde_json::from_slice(&fs::read(target.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(saved["theme"], "light");
+        assert_eq!(
+            fs::read_to_string(target.join("models.json")).unwrap(),
+            "keep these exact bytes"
+        );
+    }
+    #[test]
+    fn model_review_describes_private_whole_file_copy_and_backup() {
+        let before = model_target_preview(Some("target-hash"), true);
+        let after = model_source_preview(Some("source-hash"), None);
+        assert!(before.contains("previous file will be backed up"));
+        assert!(before.contains("Private values hidden"));
+        assert!(after.contains("entire source models.json file"));
+        assert!(after.contains("replaces the destination file"));
+        assert!(after.contains("Provider availability is not tested"));
+        assert!(after.contains("SHA256 source-hash"));
+        assert!(model_target_preview(None, true).contains("No previous models.json"));
+        assert!(model_target_preview(None, false).contains("not inspected"));
+    }
+    #[test]
+    fn model_source_failures_offer_skipping_without_pretending_to_copy() {
+        for error in [
+            "SOURCE_MODELS_INVALID_JSON",
+            "SOURCE_MODELS_UNREADABLE",
+            "SOURCE_MODELS_MISSING",
+        ] {
+            let review = model_source_preview(None, Some(error));
+            assert!(review.contains("Choose Target or Skip"));
+            assert!(review.contains("Choosing Source remains blocked"));
+            assert!(!review.contains("Copy the entire"));
+            assert!(!review.contains("SHA256"));
+        }
+    }
+    #[test]
+    fn file_errors_offer_actionable_recovery_without_raw_codes() {
+        for code in [
+            "PERMISSION_DENIED",
+            "DISK_FULL",
+            "READ_ONLY_FILESYSTEM",
+            "IO_ERROR",
+        ] {
+            let message = explain(code);
+            assert!(!message.contains(code));
+            assert!(!message.starts_with("Sync blocked:"));
+        }
     }
 }

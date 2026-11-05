@@ -30,7 +30,7 @@ On Linux, install the native [GPUI Kit build dependencies](https://gpui-kit.com/
 
 - Device ID, shell settings, default provider/model, and unrelated target values are preserved.
 - Settings and packages, reviewed MCP fields, and reviewed subagent fields are supported. Unsupported fields remain local.
-- Private models move only through private process pipes and encrypted device connections. They never enter the public repository, profiles, or review text. Replacement is blocked when default-model safety cannot be established.
+- Private models move only through private process pipes and encrypted device connections. They never enter the public repository, profiles, or review text. The entire file is copied after review, with a backup of the previous bytes. Only source JSON readability is checked; Pi owns model compatibility. Invalid or unreadable source models can be skipped while other settings sync.
 - Permission policies are preserved, not copied. This release does not yet provide the separate policy-review workflow required to change them safely.
 - A successful operation keeps one recovery backup of the files involved in that operation. Partial failures retain recovery evidence instead of pruning it.
 - Passwords/passphrases are not saved. Profiles contain connection information and Pi paths only. Changed SSH host keys fail closed.

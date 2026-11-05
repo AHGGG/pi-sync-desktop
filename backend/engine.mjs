@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import { latestPublic } from "./public-source.mjs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { handle, validateModels, summarizeModels } from "./worker.mjs";
+import { handle, decodeModels } from "./worker.mjs";
 import { SCHEMAS, validateDocument, mergeDocuments } from "./documents.mjs";
 import { cell, object, same } from "./merge.mjs";
 const fail = (code) => {
@@ -73,7 +73,7 @@ export class SyncEngine {
     const documents = input.items.filter((k) => k !== "models"),
       values = {},
       fingerprints = {};
-    let models;
+    let models, modelError;
     if (input.source.type === "public") {
       if (input.items.includes("models")) fail("PUBLIC_MODELS_FORBIDDEN");
       if (input.source.latest === true) {
@@ -99,11 +99,13 @@ export class SyncEngine {
       }
     } else {
       const source = target(input.source);
-      const snapshot = await this.call(source, {
-        op: "snapshot",
-        documents,
-        includeModels: input.items.includes("models"),
-      });
+      const snapshot = documents.length
+        ? await this.call(source, {
+            op: "snapshot",
+            documents,
+            includeModels: false,
+          })
+        : {};
       for (const name of documents) {
         values[name] = project(
           name,
@@ -113,11 +115,23 @@ export class SyncEngine {
         fingerprints[name] = snapshot[name].hash;
       }
       if (input.items.includes("models")) {
-        const exported = await this.call(source, { op: "export-models" });
-        if (exported.hash !== snapshot.models.hash) fail("SOURCE_CHANGED");
-        models = exported.modelsBase64;
-        validateModels(JSON.parse(Buffer.from(models, "base64")));
-        fingerprints.models = exported.hash;
+        try {
+          const exported = await this.call(source, { op: "export-models" });
+          const bytes = decodeModels(exported.modelsBase64);
+          if (sha(bytes) !== exported.hash) fail("SOURCE_CHANGED");
+          models = exported.modelsBase64;
+          fingerprints.models = exported.hash;
+        } catch (e) {
+          const code = safeError(e);
+          modelError = ({
+            IO_ERROR: "SOURCE_MODELS_UNREADABLE",
+            PERMISSION_DENIED: "SOURCE_MODELS_UNREADABLE",
+            INVALID_JSON: "SOURCE_MODELS_INVALID_JSON",
+            FILE_TOO_LARGE: "SOURCE_MODELS_TOO_LARGE",
+            SYMLINK_REJECTED: "SOURCE_MODELS_SYMLINK_REJECTED",
+            NOT_REGULAR_FILE: "SOURCE_MODELS_NOT_REGULAR_FILE",
+          })[code] ?? code;
+        }
       }
     }
     // Match the public harness --with-mcp behavior, but stage activation as a
@@ -134,7 +148,7 @@ export class SyncEngine {
     // MCP activation is opt-in; settings-only must not enable the extension.
     if (values.settings && !input.items.includes("mcp"))
       delete values.settings.extensions;
-    return { values, fingerprints, models };
+    return { values, fingerprints, models, modelError };
   }
   async preview(input) {
     if (
@@ -198,11 +212,10 @@ export class SyncEngine {
           op: "snapshot",
           documents: Object.keys(source.values),
           includeModels: !!source.models,
-          includeModelSummary: !!source.models,
         });
         const merged = mergeDocuments(
           source.values,
-          snapshot,
+          { state: { exists: false, value: null }, ...snapshot },
           input.resolutions?.[t.id],
         );
         const documents = Object.fromEntries(
@@ -211,32 +224,22 @@ export class SyncEngine {
             { changes: d.changes, conflicts: d.conflicts, kept: d.kept },
           ]),
         );
-        const models = source.models
+        const models = input.items.includes("models")
           ? {
-              changed: source.fingerprints.models !== snapshot.models.hash,
-              sourceHash: source.fingerprints.models,
-              targetHash: snapshot.models.hash,
-              sourceSummary: summarizeModels(
-                JSON.parse(Buffer.from(source.models, "base64")),
-              ),
-              targetSummary: snapshot.models.summary ?? null,
+              changed:
+                !!source.modelError ||
+                source.fingerprints.models !== snapshot.models?.hash,
+              sourceHash: source.fingerprints.models ?? null,
+              targetHash: snapshot.models?.hash ?? null,
+              targetInspected: !!source.models,
+              ...(source.modelError ? { error: source.modelError } : {}),
               warnings: [
+                "PRIVATE_FILE_REPLACEMENT",
+                "DEFAULT_SELECTION_PRESERVED",
                 "RUNTIME_PROVIDER_NOT_TESTED",
-                "PROJECT_AND_SESSION_SELECTION_NOT_INSPECTED",
               ],
             }
           : null;
-        if (models?.changed) {
-          try {
-            await this.call(t, {
-              op: "check-models",
-              modelSummary: models.sourceSummary,
-              expected: hashes(snapshot),
-            });
-          } catch (e) {
-            models.error = safeError(e);
-          }
-        }
         const status =
           Object.values(documents).some((d) => d.conflicts.length) ||
           (models?.changed && models.error)
@@ -286,7 +289,7 @@ export class SyncEngine {
     const prepared = plan.prepared.map((item) => {
       const merged = mergeDocuments(
         plan.source.values,
-        item.snapshot,
+        { state: { exists: false, value: null }, ...item.snapshot },
         resolutions[item.target.id] ?? plan.input.resolutions?.[item.target.id],
       );
       const choice = modelChoices[item.target.id];
@@ -299,7 +302,8 @@ export class SyncEngine {
         ? {
             ...item.models,
             changed:
-              item.models.sourceHash !== item.models.targetHash &&
+              (!!item.models.error ||
+                item.models.sourceHash !== item.models.targetHash) &&
               choice !== "target" &&
               choice !== "skip",
           }
@@ -389,8 +393,18 @@ export class SyncEngine {
       fail("COMMAND_REVIEW_REQUIRED");
     this.#plans.delete(planId); // Never replay uncertain or partially applied operations.
     if (Date.now() - plan.created > 30 * 60 * 1000) fail("PLAN_EXPIRED");
-    const source = await this.source(plan.input);
-    if (!same(source.fingerprints, plan.source.fingerprints))
+    // Skipped models are outside this apply's scope, including source revalidation
+    // and destination stale guards. They cannot block unrelated settings.
+    const includeModels = plan.prepared.some(
+      (p) => targetIds.includes(p.target.id) && p.models?.changed,
+    );
+    const source = await this.source({
+      ...plan.input,
+      items: plan.input.items.filter((name) => name !== "models" || includeModels),
+    });
+    const expectedSource = { ...plan.source.fingerprints };
+    if (!includeModels) delete expectedSource.models;
+    if (source.modelError || !same(source.fingerprints, expectedSource))
       fail("SOURCE_CHANGED");
     const results = [];
     for (const id of targetIds) {
@@ -401,6 +415,7 @@ export class SyncEngine {
           expected: hashes(item.snapshot),
           retainOneBackup: true,
         };
+        if (!item.models?.changed) delete request.expected.models;
         if (Object.keys(item.merged.documents).length)
           request.state = item.merged.state;
         for (const [name, doc] of Object.entries(item.merged.documents))

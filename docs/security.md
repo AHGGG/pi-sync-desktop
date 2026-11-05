@@ -20,7 +20,7 @@ Plans, source configuration and model content remain in memory. A private tempor
 
 ## File writes
 
-The worker rejects symlinked paths, paths inside Git repositories, oversized/malformed JSON and unsupported model schemas. It checks source fingerprints again before apply and target fingerprints before writes. A plan is consumed before applying and is not replayable after a connection failure.
+The worker rejects symlinked paths, paths inside Git repositories, nonregular files and oversized files. Selected shared documents must be valid JSON objects. Source models must be readable UTF-8 JSON, but no Pi model schema is imposed. Destination model bytes are hashed and backed up without parsing, so a malformed old file can be safely replaced. It checks source fingerprints again before apply and target fingerprints before writes. A plan is consumed before applying and is not replayable after a connection failure.
 
 Writes are individually staged and renamed, but a multi-file operation is not a distributed transaction. A process/device failure can leave some files applied. Follow the per-device outcome, inspect affected files, and prepare a new review rather than blindly retrying. Static symlink rejection and stale hashes do not claim immunity against a hostile local process racing directory replacement.
 
@@ -28,7 +28,7 @@ Recovery backups live in each target's `.harness-sync/backups` under its Pi agen
 
 ## Configuration scope
 
-The audited allowlist excludes device IDs, shell commands/paths, defaultProvider/defaultModel and permission policies. Target-only values are kept. Model-file replacement is explicit and validates the target default: an incoming custom default must still exist, or neither previous nor incoming custom configuration may touch the preserved built-in provider. Runtime availability and project/session overrides remain unverified.
+The audited allowlist excludes device IDs, shell commands/paths, defaultProvider/defaultModel and permission policies. Target-only values are kept. Model-file replacement is explicit and byte-for-byte. Default provider/model settings are preserved, not compatibility-checked; replacing custom definitions may require selecting a model in Pi afterward. Runtime availability and project/session overrides remain unverified. A source model read/JSON failure is a skippable review row, not a blocker for unrelated settings. Models skipped at apply are excluded from source revalidation and destination stale checks. Models-only sync does not parse unselected settings or baseline files.
 
 Private models can include authentication data. They travel through private process pipes and SSH, not GitHub or the review UI. Review exposes hashes and warnings rather than their content. The public source downloads only allowlisted JSON files from one fixed repository at a verified commit identifier.
 

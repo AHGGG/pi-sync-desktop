@@ -25,6 +25,7 @@ pub(crate) struct Change {
     pub before: String,
     pub after: String,
     pub conflict: bool,
+    pub source_available: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Choice {
@@ -116,7 +117,12 @@ impl Snapshot {
     pub(crate) fn unresolved_count(&self, choices: &BTreeMap<String, Choice>) -> usize {
         self.changes
             .iter()
-            .filter(|change| change.conflict && !choices.contains_key(&change.id))
+            .filter(|change| {
+                (change.conflict && !choices.contains_key(&change.id))
+                    || (!change.source_available
+                        && choices.get(&change.id).copied().unwrap_or(Choice::Source)
+                            == Choice::Source)
+            })
             .count()
     }
 
@@ -165,6 +171,7 @@ mod tests {
                 before: "old".into(),
                 after: "new".into(),
                 conflict,
+                source_available: true,
             }],
             ..Default::default()
         }
@@ -226,5 +233,18 @@ mod tests {
         assert!(snapshot.reviewed_choices(&choices).is_some());
         snapshot.command_details_reviewed = true;
         assert!(snapshot.reviewed_choices(&BTreeMap::new()).is_some());
+    }
+    #[test]
+    fn unavailable_source_requires_target_or_skip() {
+        let mut snapshot = review(true);
+        snapshot.changes[0].source_available = false;
+        let source = BTreeMap::from([("device/settings/theme".into(), Choice::Source)]);
+        assert_eq!(snapshot.unresolved_count(&source), 1);
+        assert!(snapshot.reviewed_choices(&source).is_none());
+        for choice in [Choice::Target, Choice::Skip] {
+            let choices = BTreeMap::from([("device/settings/theme".into(), choice)]);
+            assert_eq!(snapshot.unresolved_count(&choices), 0);
+            assert!(snapshot.reviewed_choices(&choices).is_some());
+        }
     }
 }

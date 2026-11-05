@@ -224,11 +224,11 @@ test("private remote models stay off review output and preserve unaffected built
     "existing",
   );
 });
-test("incompatible private models can be skipped without blocking selected settings", async (t) => {
+test("invalid source models can be skipped without blocking selected settings", async (t) => {
   const { source, target, engine } = await fixture(t);
   await fs.writeFile(
     path.join(source.agentDir, "models.json"),
-    '{"providers":{}}',
+    '{"SECRET":',
   );
   await fs.writeFile(
     path.join(target.agentDir, "models.json"),
@@ -240,7 +240,7 @@ test("incompatible private models can be skipped without blocking selected setti
     items: ["settings", "models"],
   });
   assert.equal(p.targets[0].status, "conflicts");
-  assert.equal(p.targets[0].models.error, "DEFAULT_MODEL_UNVERIFIED");
+  assert.equal(p.targets[0].models.error, "SOURCE_MODELS_INVALID_JSON");
   const q = engine.resolve({
     planId: p.planId,
     resolutions: { target: { settings: { "/theme": "source" } } },
@@ -448,7 +448,7 @@ test("MCP activation is excluded for settings-only, MCP-only, or an explicit fie
   }
 });
 
-test("destination preview receives only compatibility metadata, never source model credentials", async (t) => {
+test("destination preview receives no model contents or metadata before approval", async (t) => {
   const { source, target } = await fixture(t);
   const config = {
     providers: {
@@ -477,16 +477,12 @@ test("destination preview receives only compatibility metadata, never source mod
     items: ["models"],
   });
   assert.equal(p.targets[0].status, "ready");
-  const check = requests.find((r) => r.op === "check-models");
-  assert.equal(check.modelsBase64, undefined);
-  assert.deepEqual(check.modelSummary, {
-    providers: { custom: { models: [{ id: "chosen-model" }] } },
-  });
-  assert.deepEqual(p.targets[0].models.sourceSummary, check.modelSummary);
-  assert.deepEqual(p.targets[0].models.targetSummary, { providers: {} });
+  assert.deepEqual(requests.map(r => r.op), ["snapshot"]);
+  assert.equal(p.targets[0].models.sourceSummary, undefined);
+  assert.equal(p.targets[0].models.targetSummary, undefined);
   assert.doesNotMatch(
     JSON.stringify(p),
-    /DO_NOT_TRANSFER|private-endpoint|apiKey|Authorization|private-label/,
+    /DO_NOT_TRANSFER|private-endpoint|apiKey|Authorization|private-label|chosen-model|custom/g,
   );
   for (const request of requests) {
     const payload =
@@ -496,7 +492,7 @@ test("destination preview receives only compatibility metadata, never source mod
         : "");
     assert.doesNotMatch(
       payload,
-      /DO_NOT_TRANSFER|private-endpoint|apiKey|Authorization|private-label/,
+      /DO_NOT_TRANSFER|private-endpoint|apiKey|Authorization|private-label|chosen-model|custom/g,
     );
   }
   const beforeResolve = requests.length;
@@ -508,7 +504,7 @@ test("destination preview receives only compatibility metadata, never source mod
   assert.equal(requests.length, beforeResolve);
   assert.doesNotMatch(
     JSON.stringify(revealed),
-    /DO_NOT_TRANSFER|private-endpoint|apiKey|Authorization|private-label/,
+    /DO_NOT_TRANSFER|private-endpoint|apiKey|Authorization|private-label|chosen-model|custom/g,
   );
   await assert.rejects(
     engine.apply({ planId: q.planId, targetIds: ["target"] }),
@@ -529,4 +525,80 @@ test("destination preview receives only compatibility metadata, never source mod
     JSON.parse(Buffer.from(apply.modelsBase64, "base64")),
     config,
   );
+});
+
+for (const failure of ['missing', 'invalid-json', 'invalid-utf8', 'unreadable']) test(`source models ${failure} can be skipped while selected settings sync`, async t => {
+  const {source,target}=await fixture(t);
+  if(failure==='invalid-json') await fs.writeFile(path.join(source.agentDir,'models.json'),'{"PRIVATE_SECRET":');
+  if(failure==='invalid-utf8') await fs.writeFile(path.join(source.agentDir,'models.json'),Buffer.from([0xff]));
+  const {handle}=await import('../worker.mjs');
+  const engine=new SyncEngine(async (_target, request)=>request.op==='export-models' && failure==='unreadable'
+    ? {ok:false,error:{code:'IO_ERROR'}} : handle({...request,agentDir:source.agentDir}));
+  const p=await engine.preview({source:{...source,type:'ssh'},targets:[target],items:['settings','models'],resolutions:{target:{settings:{'/theme':'source'}}}});
+  assert.equal(p.targets[0].status,'conflicts');
+  assert.equal(p.targets[0].models.error, failure==='missing' ? 'SOURCE_MODELS_MISSING' : failure==='unreadable' ? 'SOURCE_MODELS_UNREADABLE' : 'SOURCE_MODELS_INVALID_JSON');
+  assert.doesNotMatch(JSON.stringify(p),/PRIVATE_SECRET/);
+  const stillBlocked=engine.resolve({planId:p.planId,modelChoices:{target:'source'}});
+  assert.equal(stillBlocked.targets[0].status,'conflicts');
+  await assert.rejects(engine.apply({planId:stillBlocked.planId,approved:true,targetIds:['target']}),/TARGET_NOT_READY/);
+  const q=engine.resolve({planId:stillBlocked.planId,modelChoices:{target:'skip'}});
+  assert.equal(q.targets[0].status,'ready');
+  const applied=await engine.apply({planId:q.planId,approved:true,targetIds:['target']});
+  assert.equal(applied.targets[0].status,'applied');
+  assert.equal(JSON.parse(await fs.readFile(path.join(target.agentDir,'settings.json'))).theme,'light');
+  await assert.rejects(fs.stat(path.join(target.agentDir,'models.json')),{code:'ENOENT'});
+});
+
+test('skipped models can change or become unreadable without invalidating selected settings', async t => {
+  const {source,target,engine}=await fixture(t);
+  await fs.writeFile(path.join(source.agentDir,'models.json'),'{}');
+  await fs.writeFile(path.join(target.agentDir,'models.json'),'old malformed file');
+  const p=await engine.preview({source,targets:[target],items:['settings','models'],resolutions:{target:{settings:{'/theme':'source'}}}});
+  const q=engine.resolve({planId:p.planId,modelChoices:{target:'skip'}});
+  for(const device of [source,target]) {
+    await fs.unlink(path.join(device.agentDir,'models.json'));
+    await fs.mkdir(path.join(device.agentDir,'models.json'));
+  }
+  const result=await engine.apply({planId:q.planId,approved:true,targetIds:['target']});
+  assert.equal(result.targets[0].status,'applied');
+  assert.deepEqual(result.targets[0].files,['settings','state']);
+  assert.equal((await fs.stat(path.join(target.agentDir,'models.json'))).isDirectory(),true);
+});
+
+test('models-only preview and apply preserve exact unknown schema bytes and malformed target backup', async t => {
+  const {source,target,engine}=await fixture(t);
+  const bytes=Buffer.from('{ "futureSchema": [null, {"provider":"PRIVATE_NAME", "compat":{"newRouting":true}}] }\r\n');
+  const original=Buffer.from('malformed PRIVATE_OLD {');
+  await fs.writeFile(path.join(source.agentDir,'models.json'),bytes);
+  await fs.writeFile(path.join(target.agentDir,'models.json'),original);
+  for(const device of [source,target]) {
+    await fs.writeFile(path.join(device.agentDir,'settings.json'),'invalid unselected settings');
+    await fs.mkdir(path.join(device.agentDir,'.harness-sync'));
+    await fs.writeFile(path.join(device.agentDir,'.harness-sync/shared-state.json'),'invalid unselected baseline');
+  }
+  const p=await engine.preview({source,targets:[target],items:['models']});
+  assert.equal(p.targets[0].status,'ready');
+  assert.doesNotMatch(JSON.stringify(p),/PRIVATE_NAME|PRIVATE_OLD|futureSchema|newRouting/);
+  const r=await engine.apply({planId:p.planId,approved:true,targetIds:['target']});
+  assert.equal(r.targets[0].status,'applied');
+  assert.deepEqual(r.targets[0].files,['models']);
+  assert.deepEqual(await fs.readFile(path.join(target.agentDir,'models.json')),bytes);
+  assert.deepEqual(await fs.readFile(path.join(r.targets[0].backupPath,'models.json')),original);
+});
+
+for(const device of ['source','target']) test(`${device} models edits after review prevent unreviewed replacement`, async t => {
+  const {source,target,engine}=await fixture(t);
+  await fs.writeFile(path.join(source.agentDir,'models.json'),'{}');
+  await fs.writeFile(path.join(target.agentDir,'models.json'),'old malformed file');
+  const p=await engine.preview({source,targets:[target],items:['settings','models'],resolutions:{target:{settings:{'/theme':'source'}}}});
+  await fs.writeFile(path.join((device==='source'?source:target).agentDir,'models.json'),'new malformed PRIVATE_EDIT');
+  const request={planId:p.planId,approved:true,targetIds:['target']};
+  if(device==='source') await assert.rejects(engine.apply(request),/SOURCE_CHANGED/);
+  else {
+    const r=await engine.apply(request);
+    assert.equal(r.targets[0].error,'STALE_SNAPSHOT');
+    assert.deepEqual(r.targets[0].applied,[]);
+    assert.doesNotMatch(JSON.stringify(r),/PRIVATE_EDIT/);
+  }
+  assert.equal(JSON.parse(await fs.readFile(path.join(target.agentDir,'settings.json'))).theme,'dark');
 });

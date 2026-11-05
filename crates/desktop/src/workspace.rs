@@ -9,7 +9,7 @@ use gpui_kit::component::{
     dialog::DialogButtonProps,
     form::{Field, Form},
     input::{Input, InputState},
-    radio::RadioGroup,
+    radio::{Radio, RadioGroup},
     resizable::{h_resizable, resizable_panel},
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -907,7 +907,11 @@ impl Workspace {
                             .child(
                                 div().mt_3().child(
                                     RadioGroup::new(SharedString::from(format!("resolve-{id}")))
-                                        .children(["Use source", "Keep target", "Skip"])
+                                        .children([
+                                            Radio::from("Use source").disabled(!change.source_available),
+                                            Radio::from("Keep target"),
+                                            Radio::from("Skip"),
+                                        ])
                                         .selected_index(index)
                                         .disabled(self.busy.is_some())
                                         .on_change(cx.listener(move |this, index, _, cx| {

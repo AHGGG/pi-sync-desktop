@@ -64,6 +64,7 @@ fn window(
                             before: "old".into(),
                             after: "new".into(),
                             conflict: true,
+                            source_available: true,
                         }];
                     }
                     view
@@ -200,4 +201,35 @@ fn drag_stages_item_without_applying(cx: &mut TestAppContext) {
         received.try_recv().is_err(),
         "dropping must only stage, not apply or prepare"
     );
+}
+
+#[gpui_kit::test]
+fn unavailable_model_source_is_disabled_but_skip_can_be_confirmed(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.snapshot.changes[0].path = "models.json · entire private file".into();
+            view.snapshot.changes[0].source_available = false;
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert_eq!(
+            window.within("resolve-change").find(0usize).disabled(),
+            Some(true)
+        );
+        window.within("resolve-change").click(0usize, cx);
+        assert!(!view.read(cx).choices.contains_key("change"));
+        assert_eq!(window.find("apply-reviewed").disabled(), Some(true));
+        window.within("resolve-change").click(2usize, cx);
+        assert_eq!(view.read(cx).choices.get("change"), Some(&Choice::Skip));
+        assert_ne!(window.find("apply-reviewed").disabled(), Some(true));
+        window.click("apply-reviewed", cx);
+        assert!(received.try_recv().is_err());
+        window.within("dialog").click("ok", cx);
+    })
+    .unwrap();
+    match received.try_recv().expect("explicit Apply command") {
+        Command::Apply { choices, .. } => assert_eq!(choices["change"], Choice::Skip),
+        _ => panic!("only explicit confirmation applies the skipped selection"),
+    }
 }
