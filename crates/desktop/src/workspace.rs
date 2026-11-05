@@ -48,6 +48,7 @@ pub(crate) struct Workspace {
     choices: BTreeMap<String, Choice>,
     busy: Option<String>,
     error: Option<String>,
+    authentication: Option<(String, Option<Entity<InputState>>)>,
     focus: FocusHandle,
     onboarding: bool,
     initial_snapshot_received: bool,
@@ -122,12 +123,14 @@ impl Workspace {
             choices: BTreeMap::new(),
             busy: Some("Reading device profiles".into()),
             error: None,
+            authentication: None,
             focus,
             onboarding: false,
             initial_snapshot_received: false,
             source_picker_open: false,
             setup_name: cx.new(|cx| InputState::new(window, cx).placeholder("Work laptop")),
-            setup_ssh: cx.new(|cx| InputState::new(window, cx).placeholder("ssh user@host -p 22")),
+            setup_ssh: cx
+                .new(|cx| InputState::new(window, cx).placeholder("ssh [user@]host-or-alias")),
             setup_root: cx.new(|cx| InputState::new(window, cx).placeholder("~/.pi/agent")),
             _events_task,
         };
@@ -223,6 +226,7 @@ impl Workspace {
                 self.error = None;
             }
             Event::Error(message) => {
+                self.close_authentication(window, cx);
                 self.error = Some(message);
                 self.busy = None;
             }
@@ -234,13 +238,31 @@ impl Workspace {
             Event::Authentication { request_id, prompt } => {
                 self.authenticate(request_id, prompt, window, cx)
             }
+            Event::AuthenticationFinished { request_id } => {
+                if self
+                    .authentication
+                    .as_ref()
+                    .is_some_and(|(id, _)| id == &request_id)
+                {
+                    self.close_authentication(window, cx);
+                }
+            }
         }
         cx.notify();
     }
 
+    fn close_authentication(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_, secret)) = self.authentication.take() {
+            if let Some(secret) = secret {
+                secret.update(cx, |input, cx| input.set_value("", window, cx));
+            }
+            window.close_dialog(cx);
+        }
+    }
+
     fn add_device(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("Workstation"));
-        let ssh = cx.new(|cx| InputState::new(window, cx).placeholder("ssh user@host -p 22"));
+        let ssh = cx.new(|cx| InputState::new(window, cx).placeholder("ssh [user@]host-or-alias"));
         let root = cx.new(|cx| InputState::new(window, cx).placeholder("~/.pi/agent"));
         let sender = self.commands.clone();
         window.open_alert_dialog(cx, move |dialog, _, _| {
@@ -251,7 +273,8 @@ impl Workspace {
                     .child(Field::new().label("Device name").child(Input::new(&name).id("device-name")))
                     .child(Field::new().label("SSH command or host").child(Input::new(&ssh).id("ssh-command")))
                     .child(Field::new().label("Pi agent directory").child(Input::new(&root).id("agent-root"))))
-                .child("Paste a normal SSH command. Passwords and passphrases are requested separately and are never saved in profiles.")
+                .child("Use ssh [user@]host-or-alias. OpenSSH configuration supplies omitted user and port. Passwords and passphrases are requested separately and are never saved in profiles.")
+                .child(format!("SSH client: {}", sync_core::transport::ssh_client_description()))
                 .on_ok(move |_, _, cx| {
                     let ssh_line = ssh.read(cx).value().trim().to_string();
                     if ssh_line.is_empty() { return false; }
@@ -267,6 +290,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.close_authentication(window, cx);
+        self.authentication = Some((request_id.clone(), None));
         let sender = self.commands.clone();
         window.open_alert_dialog(cx, move |dialog, _, cx| {
             let yes = sender.clone(); let no = sender.clone(); let yes_id = request_id.clone(); let no_id = request_id.clone();
@@ -291,6 +316,8 @@ impl Workspace {
                 .masked(true)
                 .placeholder("Password or key passphrase")
         });
+        self.close_authentication(window, cx);
+        self.authentication = Some((request_id.clone(), Some(secret.clone())));
         let sender = self.commands.clone();
         window.open_alert_dialog(cx, move |dialog, _, _| {
             let input = secret.clone();
@@ -467,6 +494,8 @@ impl Workspace {
                         .child(Field::new().label("Device name").child(Input::new(&self.setup_name).id("setup-device-name")))
                         .child(Field::new().label("SSH connection").child(Input::new(&self.setup_ssh).id("setup-ssh-command")))
                         .child(Field::new().label("Pi agent directory on this device").child(Input::new(&self.setup_root).id("setup-agent-root"))))
+                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Use ssh [user@]host-or-alias. OpenSSH configuration supplies omitted user and port."))
+                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child(format!("SSH client: {}", sync_core::transport::ssh_client_description())))
                     .child(Button::new("save-connection").primary().label("Save connection").disabled(self.busy.is_some())
                         .on_click(cx.listener(|this, _, _, cx| {
                             let name = this.setup_name.read(cx).value().trim().to_string();
@@ -975,6 +1004,14 @@ impl Render for Workspace {
                         .into()
                     }))
                     .child(div().flex_1())
+                    .when(self.busy.is_some(), |el| el.child(
+                        Button::new("cancel-operation").small().label("Cancel operation")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.busy.is_some() {
+                                    this.send(Command::CancelOperation, "Cancelling… Inspect targets after an interrupted apply", cx);
+                                }
+                            }))
+                    ))
                     .child("SSH passwords are not saved"),
             )
     }

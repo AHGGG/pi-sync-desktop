@@ -21,10 +21,14 @@ The public source fetches only JSON from AHGGG/my-pi-harness, resolving HEAD to 
 ## Module interfaces
 
 - `crates/desktop`: GPUI Kit presentation and an I/O worker. UI state never owns a network session or touches target files.
-- `crates/sync-core`: strict connection parsing, host identity/authentication, fixed SSH worker transport, nonsecret profile persistence.
+- `crates/sync-core`: strict connection parsing, system OpenSSH transport and native askpass bridge, nonsecret profile persistence.
 - `backend`: dependency-free Node JSONL engine adapted from my-pi-harness at 1d8b174. Captured plans and private content remain in process memory. Field allowlists, merge semantics, stale-plan rejection and backup/partial-failure behavior stay behind this interface.
 
-All network/filesystem work runs away from the UI thread. Authentication events pause the I/O worker for a response from a native masked-input or host-trust dialog. JSONL stdout is a private protocol, not a diagnostic stream.
+All network/filesystem work runs away from the UI thread. Authentication events pause the I/O worker for a response from a native masked-input or host-trust dialog. JSONL stdout is a private protocol, not a diagnostic stream. Each remote connection owns one system SSH process and one persistent Node worker. This preserves worker state between snapshot and apply without spawning a fresh session per operation. Requests/code are carried as bounded JSONL data through private pipes; the remote launcher is fixed. Failed or uncertain requests poison the connection and cannot trigger an automatic apply retry.
+
+System OpenSSH provides normal aliases, identities, native-agent selection and cryptographic negotiation. New omitted user/port values defer to config; legacy explicit fields retain their meaning. The GUI askpass helper uses a capability-authenticated local bridge for password, passphrase and unknown-host prompts. Changed keys remain blocked. Standard user and native global host trust are retained alongside the app's private file; custom `UserKnownHostsFile` and `KnownHostsCommand` fail preflight instead of silently changing the trust policy.
+
+The app disables config-driven forwarding, proxy/jump paths, local/remote commands, multiplexing, session suppression and keyboard-interactive/MFA. This is a constrained session, not a sandbox for trusted local SSH config: `Match exec` can still execute during configuration parsing. Agent environment is inherited at launch. Bitwarden may supply the native agent, but approval stays in Bitwarden and actual interoperability must be verified separately.
 
 ## Guidance used
 

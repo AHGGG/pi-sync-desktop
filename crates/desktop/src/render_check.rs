@@ -12,6 +12,9 @@ use gpui_kit::{AppContext, Bounds, HeadlessAppContext, WindowBounds, WindowOptio
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 fn main() -> anyhow::Result<()> {
+    if let Some(code) = sync_core::askpass::run_helper_if_requested() {
+        std::process::exit(code);
+    }
     let output = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)

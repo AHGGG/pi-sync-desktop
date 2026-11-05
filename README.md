@@ -8,7 +8,7 @@ A native Rust + GPUI Kit workspace for reviewing Pi configuration changes before
 
 ## Run from source
 
-Requires Rust 1.92+, Node.js 20+ on the computer running the app, and Node.js 20+ on SSH destinations. Node is the dependency-free configuration worker, not the UI. Authentication uses libssh2, your SSH agent or keys, and in-app password/passphrase prompts.
+Requires Rust 1.92+, Node.js 20+ on the computer running the app, and Node.js 20+ on SSH destinations. Node is the dependency-free configuration worker, not the UI. SSH connections use your system OpenSSH client, its configured identities/agent, and native in-app password/passphrase and host-trust prompts. OpenSSH 8.7+ is required.
 
 ```sh
 cargo run --locked -p pi-sync-desktop
@@ -27,6 +27,16 @@ On Linux, install the native [GPUI Kit build dependencies](https://gpui-kit.com/
 **Review saved selection** reads fresh data with one click. It never reuses an old plan or silently applies remembered decisions. Local OS icons and generic SSH-device icons distinguish devices without guessing a remote platform.
 
 Custom paths are relative to each configured Pi directory, not arbitrary absolute source/destination mappings. Folders are recursive; target-only files are never deleted and empty folders are not copied. Transfers allow 256 files, 4 MiB per file and 8 MiB total custom bytes. Symlinks, Git working trees, authentication/credential paths, hidden paths and nonportable names are blocked with an error rather than silently skipped.
+
+## SSH setup
+
+Enter `ssh user@host`, or an OpenSSH alias such as `ssh mac-mini`. Optional `-p port` and `-i key-path` are supported. New connections with an omitted user or port resolve those values through OpenSSH configuration; previously saved profiles keep their explicit user and port. Node.js 20+ must be available to the destination's noninteractive SSH session.
+
+The app inherits its SSH agent environment when launched. An agent such as Bitwarden can supply keys through the system client when configured for it; unlock and approve access in the agent's own app. Restart Pi Sync after changing the agent environment. This is not a claim that your Bitwarden setup or Windows-to-Mac connection has been tested. Passwords and passphrases are never saved.
+
+Install the OpenSSH Client optional feature on Windows, check the built-in `/usr/bin/ssh` and PATH on macOS, or `openssh-client` on Debian/Ubuntu Linux. Reopen Pi Sync afterward. Windows prefers the system OpenSSH client over a Git-bundled client. Setup shows the chosen client. Older clients that reject required options need an update; the app does not weaken server key-exchange settings.
+
+Forwarding, proxy/jump hosts, local/remote commands, connection multiplexing and keyboard-interactive/MFA are not supported. Standard user known-hosts files and native global trust are supported alongside the app's trust file. Aliases with custom `UserKnownHostsFile` or `KnownHostsCommand` are blocked before connecting, not silently given a new trust store. OpenSSH configuration is trusted local code: `Match exec` can execute while it is being parsed. See [security](docs/security.md).
 
 ## Safety and scope
 

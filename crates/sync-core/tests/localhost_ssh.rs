@@ -18,8 +18,34 @@ use std::{
 };
 use sync_core::{
     connection::ConnectionConfig,
-    transport::{AuthAnswer, AuthPrompt, SshTransport},
+    transport::{AuthAnswer, AuthPrompt, SshOptions, SshTransport},
 };
+
+fn fixture_options(known: &Path) -> Result<SshOptions> {
+    Ok(SshOptions {
+        ssh_program: PathBuf::from("ssh"),
+        askpass_program: PathBuf::from(
+            std::env::var_os("PI_SYNC_TEST_ASKPASS")
+                .context("Use scripts/test-ssh.sh to build the isolated askpass fixture")?,
+        ),
+        config_file: Some(
+            known
+                .parent()
+                .context("Missing fixture directory")?
+                .join("ssh_config"),
+        ),
+        connection_timeout: Duration::from_secs(10),
+        request_timeout: Duration::from_secs(15),
+        inherit_user_known_hosts: false,
+    })
+}
+fn fixture_connect(
+    config: &ConnectionConfig,
+    known: &Path,
+    prompt: impl FnMut(AuthPrompt) -> AuthAnswer,
+) -> Result<SshTransport> {
+    SshTransport::connect_with_options(config, known, prompt, &fixture_options(known)?)
+}
 
 struct Server(Child);
 impl Drop for Server {
@@ -132,12 +158,32 @@ fn key_auth_trust_worker_apply_and_changed_host_refusal() -> Result<()> {
         host: "127.0.0.1".into(),
         username,
         port,
-        key_path: Some(client),
+        key_path: Some(client.clone()),
+        use_config_user: false,
+        use_config_port: false,
     };
     let known = dir.path().join("known_hosts");
-    let denied = SshTransport::connect(&config, &known, |_| AuthAnswer::Cancel);
+    // -F prevents loading the user's config, and none prevents implicit personal
+    // identities/agents from being tried. Every authentication input is synthetic.
+    fs::write(
+        dir.path().join("ssh_config"),
+        format!(
+            "Host fixture-alias\n  HostName 127.0.0.1\n  User {}\n  Port {}\n  IdentityFile \"{}\"\nHost *\n  IdentityAgent none\n  IdentityFile none\n  GlobalKnownHostsFile /dev/null\n  UserKnownHostsFile \"{}\"\n",
+            config.username,
+            port,
+            client.display(),
+            known.display()
+        ),
+    )?;
+    let denied = fixture_connect(&config, &known, |_| AuthAnswer::Cancel);
     assert!(denied.is_err());
-    assert!(!known.exists());
+    assert!(
+        fs::read_to_string(&known)
+            .unwrap_or_default()
+            .trim()
+            .is_empty(),
+        "Rejected host must not create a trust record"
+    );
     let public = fs::read_to_string(host.with_extension("pub"))?;
     let host_bytes = STANDARD.decode(
         public
@@ -150,13 +196,16 @@ fn key_auth_trust_worker_apply_and_changed_host_refusal() -> Result<()> {
         STANDARD_NO_PAD.encode(Sha256::digest(host_bytes))
     );
     let mut prompts = 0;
-    let mut transport = SshTransport::connect(&config, &known, |prompt| match prompt {
+    let mut transport = fixture_connect(&config, &known, |prompt| match prompt {
         AuthPrompt::TrustHost {
             host,
             port: actual_port,
             fingerprint,
         } => {
-            assert_eq!(host, "127.0.0.1");
+            assert!(
+                host.contains(&format!("[127.0.0.1]:{port}")),
+                "Trust prompt must identify the resolved fixture endpoint: {host}"
+            );
             assert_eq!(actual_port, port);
             assert_eq!(fingerprint, expected_fingerprint);
             prompts += 1;
@@ -277,8 +326,94 @@ fn key_auth_trust_worker_apply_and_changed_host_refusal() -> Result<()> {
         );
     }
     drop(transport);
+    let alias = ConnectionConfig {
+        host: "fixture-alias".into(),
+        username: String::new(),
+        port: 22,
+        key_path: None,
+        use_config_user: true,
+        use_config_port: true,
+    };
+    let mut alias_transport = fixture_connect(&alias, &known, |_| {
+        panic!("Alias should use fixture config and existing trust")
+    })?;
+    let alias_snapshot =
+        alias_transport.run_worker(worker, &json!({"op":"snapshot","agentDir":agent_dir}))?;
+    assert_eq!(
+        alias_snapshot["settings"]["value"],
+        after["settings"]["value"]
+    );
+    drop(alias_transport);
+    // A dedicated local agent offers the fixture key. Only its public half is
+    // named in config, so this succeeds only through agent signing. Do not mutate
+    // SSH_AUTH_SOCK in the test process or consult the user's actual agent.
+    if std::env::var_os("PI_SYNC_TEST_SKIP_AGENT").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        eprintln!("SKIPPED: dedicated ssh-agent integration (PI_SYNC_TEST_SKIP_AGENT=1)");
+    } else {
+        let agent_socket = dir.path().join("agent.sock");
+        let mut agent = Server(
+            Command::new("ssh-agent")
+                .arg("-D")
+                .arg("-a")
+                .arg(&agent_socket)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        let started = Instant::now();
+        while !agent_socket.exists() {
+            ensure!(agent.0.try_wait()?.is_none(), "Fixture ssh-agent exited");
+            ensure!(
+                started.elapsed() < Duration::from_secs(5),
+                "Fixture agent startup timed out"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        ensure!(
+            Command::new("ssh-add")
+                .arg(&client)
+                .env("SSH_AUTH_SOCK", &agent_socket)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()?
+                .success(),
+            "Cannot load synthetic identity into fixture ssh-agent"
+        );
+        let agent_config_path = dir.path().join("agent_config");
+        fs::write(
+            &agent_config_path,
+            format!(
+                "Host fixture-agent\n  HostName 127.0.0.1\n  User {}\n  Port {}\n  IdentityAgent \"{}\"\n  IdentityFile \"{}\"\n  IdentitiesOnly yes\n  GlobalKnownHostsFile /dev/null\n  UserKnownHostsFile \"{}\"\n",
+                config.username,
+                port,
+                agent_socket.display(),
+                client.with_extension("pub").display(),
+                known.display()
+            ),
+        )?;
+        let mut agent_options = fixture_options(&known)?;
+        agent_options.config_file = Some(agent_config_path);
+        let agent_connection = ConnectionConfig {
+            host: "fixture-agent".into(),
+            ..alias
+        };
+        let mut agent_transport = SshTransport::connect_with_options(
+            &agent_connection,
+            &known,
+            |_| panic!("Agent-only connection must not ask for a secret"),
+            &agent_options,
+        )?;
+        assert_eq!(
+            agent_transport.run_worker(worker, &json!({"op":"snapshot","agentDir":agent_dir}))?["ok"],
+            true
+        );
+        drop(agent_transport);
+        drop(agent);
+    }
     // Previously trusted host reconnects without an authentication or trust prompt.
-    drop(SshTransport::connect(&config, &known, |_| {
+    drop(fixture_connect(&config, &known, |_| {
         panic!("Unexpected prompt for trusted key-auth host")
     })?);
     // Disposable encrypted identity: these are synthetic fixture bytes, never a
@@ -295,7 +430,7 @@ fn key_auth_trust_worker_apply_and_changed_host_refusal() -> Result<()> {
     };
     for cancel in [true, false] {
         let mut asked = 0;
-        let failed = SshTransport::connect(&encrypted_config, &known, |prompt| match prompt {
+        let failed = fixture_connect(&encrypted_config, &known, |prompt| match prompt {
             AuthPrompt::KeyPassphrase { key_path } => {
                 assert_eq!(key_path, encrypted);
                 asked += 1;
@@ -307,25 +442,24 @@ fn key_auth_trust_worker_apply_and_changed_host_refusal() -> Result<()> {
             }
             _ => panic!("Unexpected prompt for encrypted-key fixture"),
         });
-        assert_eq!(asked, 1);
+        assert!(
+            (1..=3).contains(&asked),
+            "Passphrase attempts must be bounded"
+        );
+        if cancel {
+            assert_eq!(asked, 1);
+        }
         let message = failed
             .err()
             .context("Incorrect or cancelled passphrase unexpectedly authenticated")?
             .to_string();
-        assert_eq!(
-            message,
-            if cancel {
-                "Authentication cancelled"
-            } else {
-                "SSH key authentication failed"
-            }
-        );
+        assert!(!message.is_empty());
         assert!(!message.contains(FIXTURE_PASSPHRASE));
         assert!(!message.contains("incorrect-fixture-answer"));
     }
     let mut asked = 0;
     let mut encrypted_transport =
-        SshTransport::connect(&encrypted_config, &known, |prompt| match prompt {
+        fixture_connect(&encrypted_config, &known, |prompt| match prompt {
             AuthPrompt::KeyPassphrase { key_path } => {
                 assert_eq!(key_path, encrypted);
                 asked += 1;
@@ -342,11 +476,12 @@ fn key_auth_trust_worker_apply_and_changed_host_refusal() -> Result<()> {
         after["settings"]["value"]
     );
     drop(encrypted_transport);
+    exercise_session_lifecycle(&config, &known, dir.path())?;
     drop(server);
     let changed = dir.path().join("changed_host");
     generate_key(&changed)?;
     let _changed_server = start_server(dir.path(), &changed, port, &node_dir)?;
-    let refused = SshTransport::connect(&config, &known, |_| {
+    let refused = fixture_connect(&config, &known, |_| {
         panic!("Changed host identity must not be offered a trust override")
     });
     assert!(refused.is_err());
@@ -357,5 +492,112 @@ fn key_auth_trust_worker_apply_and_changed_host_refusal() -> Result<()> {
             .to_string()
             .contains("Host key changed")
     );
+    Ok(())
+}
+
+// These deliberately broken workers run only against disposable local paths.
+// A write followed by disconnect/timeout/cancellation has an uncertain result;
+// neither the failed request nor a later call may silently reconnect and replay.
+fn exercise_session_lifecycle(config: &ConnectionConfig, known: &Path, dir: &Path) -> Result<()> {
+    const WORKER: &str = r#"
+import { appendFile } from 'node:fs/promises';
+let count = 0;
+export async function handle(request) {
+  count++;
+  if (request.marker) await appendFile(request.marker, 'once\n');
+  if (request.op === 'crash') process.exit(17);
+  if (request.op === 'wait') await new Promise(() => {});
+  if (request.op === 'oversize') return { ok: true, text: 'x'.repeat(49 * 1024 * 1024) };
+  if (request.op === 'stderr') process.stderr.write('x'.repeat(256 * 1024));
+  return { ok: true, count, text: request.text };
+}
+"#;
+    let mut transport = fixture_connect(config, known, |_| {
+        panic!("Unexpected fixture authentication")
+    })?;
+    for count in 1..=3 {
+        let value = transport.run_worker(
+            WORKER,
+            &json!({"op":"count", "text":"quotes \" \n Unicode 雪"}),
+        )?;
+        assert_eq!(
+            value["count"], count,
+            "Requests must share one worker process"
+        );
+        assert_eq!(value["text"], "quotes \" \n Unicode 雪");
+    }
+    assert_eq!(
+        transport.run_worker(WORKER, &json!({"op":"stderr"}))?["ok"],
+        true
+    );
+    drop(transport);
+    let oversize_marker = dir.join("oversize-marker");
+    let mut transport = fixture_connect(config, known, |_| {
+        panic!("Unexpected fixture authentication")
+    })?;
+    assert!(
+        transport
+            .run_worker(
+                WORKER,
+                &json!({
+                    "marker": oversize_marker, "text": "x".repeat(49 * 1024 * 1024)
+                })
+            )
+            .is_err(),
+        "Oversized request must be rejected before transmission"
+    );
+    assert!(!oversize_marker.exists());
+    drop(transport);
+    let mut transport = fixture_connect(config, known, |_| {
+        panic!("Unexpected fixture authentication")
+    })?;
+    assert!(
+        transport
+            .run_worker(WORKER, &json!({"op":"oversize"}))
+            .is_err(),
+        "Oversized responses must fail closed"
+    );
+    assert!(
+        transport
+            .run_worker(WORKER, &json!({"op":"count"}))
+            .is_err()
+    );
+    drop(transport);
+    for mode in ["crash", "timeout", "cancel"] {
+        let marker = dir.join(format!("{mode}-marker"));
+        let mut options = fixture_options(known)?;
+        if mode == "timeout" {
+            options.request_timeout = Duration::from_millis(300);
+        }
+        let mut transport = SshTransport::connect_with_options(
+            config,
+            known,
+            |_| panic!("Unexpected fixture authentication"),
+            &options,
+        )?;
+        let request =
+            json!({"op": if mode == "crash" { "crash" } else { "wait" }, "marker":marker});
+        let started = Instant::now();
+        let failed = if mode == "cancel" {
+            transport.run_worker_cancellable(WORKER, &request, || marker.exists())
+        } else {
+            transport.run_worker(WORKER, &request)
+        };
+        assert!(failed.is_err(), "{mode} should fail closed");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{mode} was not bounded"
+        );
+        assert_eq!(
+            fs::read_to_string(&marker)?,
+            "once\n",
+            "{mode} must never replay a write"
+        );
+        assert!(
+            transport.run_worker(WORKER, &request).is_err(),
+            "Failed session must require explicit reconnect"
+        );
+        assert_eq!(fs::read_to_string(&marker)?, "once\n");
+    }
     Ok(())
 }

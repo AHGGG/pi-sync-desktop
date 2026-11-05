@@ -17,10 +17,10 @@ test('all private protocol boundaries share the bounded combined-file envelope',
   assert.match(bridge, /Buffer\.byteLength\(next\) > MAX_PROTOCOL_BYTES/);
   assert.match(bridge, /Buffer\.byteLength\(buffer\) > MAX_PROTOCOL_BYTES/);
   assert.match(worker, /length > MAX_PROTOCOL_BYTES/);
-  assert.match(ssh, /const MAX: usize = 48 \* 1024 \* 1024/);
-  assert.match(ssh, /s\.length>50331648/);
+  assert.match(ssh, /const MAX_PROTOCOL_BYTES: usize = 48 \* 1024 \* 1024/);
+  assert.match(ssh, /Buffer\.byteLength\(b\)>50331649/);
   assert.match(ssh, /payload\.len\(\) <= MAX/);
-  assert.match(ssh, /bytes\.len\(\) \+ n <= MAX/);
+  assert.match(ssh, /n <= MAX_PROTOCOL_BYTES \+ 1/);
   assert.match(desktop, /48 \* 1024 \* 1024/);
 });
 

@@ -70,6 +70,7 @@ pub(crate) enum Command {
         items: Vec<String>,
     },
     CancelReview,
+    CancelOperation,
     RepeatLast,
     RevealDetails {
         plan_id: String,
@@ -105,6 +106,9 @@ pub(crate) enum Event {
     Authentication {
         request_id: String,
         prompt: String,
+    },
+    AuthenticationFinished {
+        request_id: String,
     },
 }
 

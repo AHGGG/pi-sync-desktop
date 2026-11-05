@@ -462,3 +462,121 @@ fn failed_connection_is_a_blocked_review_not_zero_differences(cx: &mut TestAppCo
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+fn busy_cancel_sends_only_cancel_and_keeps_apply_disabled(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.busy = Some("Applying the changes you reviewed…".into());
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.click("cancel-operation", cx);
+        assert!(matches!(received.try_recv(), Ok(Command::CancelOperation)));
+        assert!(received.try_recv().is_err());
+        assert!(
+            view.read(cx)
+                .busy
+                .as_deref()
+                .unwrap()
+                .contains("Inspect targets")
+        );
+        window.render_frame(cx);
+        assert_eq!(window.find("apply-reviewed").disabled(), Some(true));
+        window.click("apply-reviewed", cx);
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn finished_authentication_closes_prompt_and_erases_unsent_secret(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, false);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.receive(
+                crate::ui_model::Event::Authentication {
+                    request_id: "auth-cancelled".into(),
+                    prompt: "Password".into(),
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        window.within("dialog").click("ssh-secret", cx);
+        window.input("never-send-this", cx);
+        let secret = view
+            .read(cx)
+            .authentication
+            .as_ref()
+            .unwrap()
+            .1
+            .clone()
+            .unwrap();
+        view.update(cx, |view, cx| {
+            view.receive(
+                crate::ui_model::Event::AuthenticationFinished {
+                    request_id: "unrelated-old-prompt".into(),
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        assert!(!window.find_all("ssh-secret").is_empty());
+        view.update(cx, |view, cx| {
+            view.receive(
+                crate::ui_model::Event::AuthenticationFinished {
+                    request_id: "auth-cancelled".into(),
+                },
+                window,
+                cx,
+            );
+            view.receive(
+                crate::ui_model::Event::Error("Operation cancelled".into()),
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        assert!(window.find_all("ssh-secret").is_empty());
+        assert!(view.read(cx).authentication.is_none());
+        assert!(secret.read(cx).value().is_empty());
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn worker_error_closes_pending_host_trust_without_accepting(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, false);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.receive(
+                crate::ui_model::Event::TrustHost {
+                    request_id: "trust-cancelled".into(),
+                    host: "example.invalid".into(),
+                    fingerprint: "SHA256:test".into(),
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        assert!(!window.find_all("dialog").is_empty());
+        view.update(cx, |view, cx| {
+            view.receive(
+                crate::ui_model::Event::Error("Operation cancelled".into()),
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        assert!(window.find_all("dialog").is_empty());
+        assert!(view.read(cx).authentication.is_none());
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}

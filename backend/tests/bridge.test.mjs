@@ -5,10 +5,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
-function bridge(t, onTransport) {
+function bridge(t, onTransport, nodeArgs = []) {
   const child = spawn(
     process.execPath,
-    [new URL("../bridge.mjs", import.meta.url).pathname],
+    [...nodeArgs, new URL("../bridge.mjs", import.meta.url).pathname],
     { stdio: ["pipe", "pipe", "pipe"] },
   );
   const pending = new Map();
@@ -151,4 +151,19 @@ test("explicit reveal exposes captured MCP details only, never other masked fiel
   assert.equal(r.planId, p.planId);
   assert.match(JSON.stringify(r), /sk-MCP_SECRET/);
   assert.doesNotMatch(JSON.stringify(r), /sk-OTHER_SECRET/);
+});
+
+test("native authentication owns transport lifetime without an independent bridge timeout", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-bridge-clock-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const preload = path.join(root, "clock.cjs");
+  // Accelerate the former 90s transport deadline, without slowing the suite.
+  await fs.writeFile(preload, "const original = setTimeout; global.setTimeout = (f, ms, ...args) => original(f, ms === 90000 ? 1 : ms, ...args);\n");
+  const request = bridge(t, async () => {
+    await new Promise(resolve => setTimeout(resolve, 50));
+    return { ok: true, settings: { exists: false, hash: null, value: null }, state: { exists: false, hash: null, value: null } };
+  }, ["--require", preload]);
+  const response = await request({ op: "preview", source: { id: "source", type: "ssh", agentDir: "~/.pi/agent" }, targets: [{ id: "target", type: "ssh", agentDir: "~/.pi/agent" }], items: ["settings"] });
+  assert.equal(response.ok, true);
+  assert.equal(response.targets[0].status, "ready");
 });

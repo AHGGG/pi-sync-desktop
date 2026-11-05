@@ -10,6 +10,11 @@ pub struct ConnectionConfig {
     pub username: String,
     pub port: u16,
     pub key_path: Option<PathBuf>,
+    /// Missing fields retain the explicit user/port semantics of version-1 profiles.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_config_user: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_config_port: bool,
 }
 impl ConnectionConfig {
     pub fn parse(input: &str) -> Result<Self> {
@@ -23,7 +28,7 @@ impl ConnectionConfig {
         let tokens = tokenize(input)?;
         ensure!(
             tokens.first().map(String::as_str) == Some("ssh"),
-            "Use ssh user@host [-p port] [-i key-path]"
+            "Use ssh [user@]host-or-alias [-p port] [-i key-path]"
         );
         let mut destination = None;
         let mut port = None;
@@ -70,10 +75,10 @@ impl ConnectionConfig {
             }
             i += 1;
         }
-        let destination = destination.ok_or_else(|| anyhow::anyhow!("Missing user@host"))?;
-        let (username, host) = destination
-            .split_once('@')
-            .ok_or_else(|| anyhow::anyhow!("Specify user@host explicitly"))?;
+        let destination =
+            destination.ok_or_else(|| anyhow::anyhow!("Missing SSH host or alias"))?;
+        let (username, host) = destination.split_once('@').unwrap_or(("", &destination));
+        let use_config_user = !destination.contains('@');
         let host = if host.starts_with('[') {
             let inner = host
                 .strip_prefix('[')
@@ -92,20 +97,35 @@ impl ConnectionConfig {
             host: host.into(),
             port: port.unwrap_or(22),
             key_path,
+            use_config_user,
+            use_config_port: port.is_none(),
         };
         config.validate()?;
         Ok(config)
     }
+    pub fn display_address(&self) -> String {
+        let destination = if self.use_config_user {
+            self.host.clone()
+        } else {
+            format!("{}@{}", self.username, self.host)
+        };
+        if self.use_config_port {
+            destination
+        } else {
+            format!("{destination}:{}", self.port)
+        }
+    }
     pub fn validate(&self) -> Result<()> {
         ensure!(self.port != 0, "Port must be 1–65535");
         ensure!(
-            !self.username.is_empty()
-                && self.username.len() <= 64
-                && !self.username.starts_with('-')
-                && self
-                    .username
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c)),
+            (self.use_config_user && self.username.is_empty())
+                || (!self.username.is_empty()
+                    && self.username.len() <= 64
+                    && !self.username.starts_with('-')
+                    && self
+                        .username
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))),
             "Invalid SSH username"
         );
         ensure!(
@@ -115,7 +135,7 @@ impl ConnectionConfig {
                 && self
                     .host
                     .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b".:-".contains(&c)),
+                    .all(|c| c.is_ascii_alphanumeric() || b"._:-".contains(&c)),
             "Invalid SSH host"
         );
         if self.host.contains(':') {
@@ -198,6 +218,19 @@ mod tests {
         assert_eq!(c.port, 22);
     }
     #[test]
+    fn aliases_inherit_omitted_user_and_port_without_changing_legacy_profiles() {
+        let config = ConnectionConfig::parse("ssh mac-mini").unwrap();
+        assert!(config.use_config_user && config.use_config_port);
+        assert_eq!(config.display_address(), "mac-mini");
+        let explicit = ConnectionConfig::parse("ssh me@mac-mini -p 22").unwrap();
+        assert!(!explicit.use_config_user && !explicit.use_config_port);
+        let legacy: ConnectionConfig =
+            serde_json::from_str(r#"{"host":"old","username":"me","port":22,"key_path":null}"#)
+                .unwrap();
+        assert!(!legacy.use_config_user && !legacy.use_config_port);
+        legacy.validate().unwrap();
+    }
+    #[test]
     fn refuses_commands_forwarding_proxy_and_injection() {
         for s in [
             "ssh pi@host ls",
@@ -210,7 +243,7 @@ mod tests {
             "ssh pi@host -p 0",
             "ssh pi@host -p 65536",
             "ssh pi@host -p 22 -p 23",
-            "ssh host",
+            "ssh @host",
             "ssh -bad@host",
             "ssh pi@host -i",
             "ssh pi@host -i 'unfinished",

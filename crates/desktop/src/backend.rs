@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Stdio},
     sync::mpsc::{self, Receiver, Sender},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use sync_core::{
     connection::ConnectionConfig,
@@ -157,6 +157,7 @@ struct Backend {
     plan: Option<Value>,
     changes: HashMap<String, (String, String, String)>,
     request: u64,
+    operation_cancelled: bool,
 }
 
 pub(crate) fn start() -> (Sender<Command>, Receiver<Event>) {
@@ -202,6 +203,7 @@ pub(crate) fn start() -> (Sender<Command>, Receiver<Event>) {
             plan: None,
             changes: HashMap::new(),
             request: 0,
+            operation_cancelled: false,
         };
         state.restore_startup_selection();
         state.publish();
@@ -248,10 +250,7 @@ impl Backend {
             Device {
                 id: p.id.clone(),
                 name: p.name.clone(),
-                address: format!(
-                    "{}@{}:{}",
-                    p.connection.username, p.connection.host, p.connection.port
-                ),
+                address: p.connection.display_address(),
                 status: if self.connection_errors.contains_key(&p.id) {
                     "Connection failed"
                 } else if self.sessions.contains_key(&p.id) {
@@ -297,7 +296,20 @@ impl Backend {
         let _ = self.events.send(Event::Busy(text.into()));
     }
     fn handle(&mut self, command: Command) -> Result<()> {
+        if !matches!(
+            &command,
+            Command::Authenticate { .. }
+                | Command::TrustHost { .. }
+                | Command::CancelAuthentication { .. }
+                | Command::CancelOperation
+        ) {
+            self.operation_cancelled = false;
+        }
         match command {
+            Command::CancelOperation => {
+                self.cancel_operation();
+                self.publish();
+            }
             Command::Refresh => {
                 self.invalidate();
                 self.snapshot.blocked_targets.clear();
@@ -321,6 +333,8 @@ impl Backend {
                         .any(|p| p.connection.host == connection.host
                             && p.connection.username == connection.username
                             && p.connection.port == connection.port
+                            && p.connection.use_config_user == connection.use_config_user
+                            && p.connection.use_config_port == connection.use_config_port
                             && p.agent_dir == root),
                     "This device and Pi directory are already saved"
                 );
@@ -723,8 +737,11 @@ impl Backend {
         let new_plan = resolved["planId"]
             .as_str()
             .context("Invalid resolved plan identifier")?;
+        let command_reviewed = self.snapshot.command_details_reviewed;
+        // Consume approval before sending: interruption must never leave a replayable review.
+        self.invalidate();
         let result =
-            self.call(json!({"op":"apply","planId":new_plan,"approved":true,"targetIds":ready,"commandReviewApproved":self.snapshot.command_details_reviewed}))?;
+            self.call(json!({"op":"apply","planId":new_plan,"approved":true,"targetIds":ready,"commandReviewApproved":command_reviewed}))?;
         self.invalidate();
         self.snapshot.blocked_targets = blocked.clone();
         self.snapshot.results = blocked;
@@ -777,7 +794,34 @@ impl Backend {
                 .unwrap_or_else(|| id.into())
         }
     }
+    fn cancel_operation(&mut self) {
+        self.operation_cancelled = true;
+        self.engine = None;
+        self.sessions.clear();
+        self.invalidate();
+    }
+    fn poll_cancellation(&mut self) -> bool {
+        while let Ok(command) = self.commands.try_recv() {
+            match command {
+                Command::CancelOperation | Command::CancelReview => self.cancel_operation(),
+                // Prompt responses outside their matching prompt are stale.
+                Command::Authenticate { secret, .. } => drop(secret),
+                Command::TrustHost { .. } | Command::CancelAuthentication { .. } => {}
+                command => self.pending.push_back(command),
+            }
+        }
+        self.operation_cancelled
+    }
+    fn check_cancelled(&self) -> Result<()> {
+        ensure!(
+            !self.operation_cancelled,
+            "Operation cancelled. An interrupted apply may have written files. Inspect target results and prepare a new review before retrying"
+        );
+        Ok(())
+    }
     fn call(&mut self, mut request: Value) -> Result<Value> {
+        self.poll_cancellation();
+        self.check_cancelled()?;
         if self.engine.is_none() {
             self.engine = Some(Engine::spawn()?);
         }
@@ -786,19 +830,35 @@ impl Backend {
         request["id"] = json!(id);
         self.engine.as_mut().unwrap().send(&request)?;
         loop {
-            let value = self
-                .engine
-                .as_ref()
-                .unwrap()
-                .output
-                .recv_timeout(Duration::from_secs(120));
-            let value = match value {
-                Ok(Ok(v)) => v,
-                _ => {
+            // Keep the original overall deadline for this wait; polling must not extend it.
+            let deadline = Instant::now() + Duration::from_secs(120);
+            let value = loop {
+                self.poll_cancellation();
+                self.check_cancelled()?;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
                     self.engine = None;
+                    self.sessions.clear();
                     bail!(
                         "The sync worker stopped or timed out. If applying, inspect target results before preparing again"
                     );
+                }
+                let value = self
+                    .engine
+                    .as_ref()
+                    .context("The sync worker stopped")?
+                    .output
+                    .recv_timeout(remaining.min(Duration::from_millis(20)));
+                match value {
+                    Ok(Ok(v)) => break v,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    _ => {
+                        self.engine = None;
+                        self.sessions.clear();
+                        bail!(
+                            "The sync worker stopped or timed out. If applying, inspect target results before preparing again"
+                        );
+                    }
                 }
             };
             if value["type"] == "transport" {
@@ -807,6 +867,7 @@ impl Backend {
                     .context("Invalid transport target")?
                     .to_owned();
                 let response = self.remote(&target_id, &value["request"]);
+                self.check_cancelled()?;
                 let message = match response {
                     Ok(response) => {
                         json!({"op":"transport-result","transportId":value["transportId"],"response":response})
@@ -817,7 +878,10 @@ impl Backend {
                         json!({"op":"transport-result","transportId":value["transportId"],"error":"SSH_FAILED"})
                     }
                 };
-                self.engine.as_mut().unwrap().send(&message)?;
+                self.engine
+                    .as_mut()
+                    .context("The sync worker stopped")?
+                    .send(&message)?;
             } else if value["id"] == id {
                 if value["ok"] != true {
                     bail!(
@@ -835,6 +899,8 @@ impl Backend {
         }
     }
     fn remote(&mut self, id: &str, request: &Value) -> Result<Value> {
+        self.poll_cancellation();
+        self.check_cancelled()?;
         if !self.sessions.contains_key(id) {
             let profile = self
                 .profiles
@@ -843,18 +909,23 @@ impl Backend {
                 .context("Unknown SSH device")?
                 .clone();
             let known = self.config_dir.join("known_hosts");
-            let session = SshTransport::connect(&profile.connection, &known, |prompt| {
-                self.prompt(prompt, &profile.name, &profile.connection)
-            })?;
+            let session =
+                SshTransport::connect_with_control(&profile.connection, &known, |prompt| {
+                    match prompt {
+                        Some(prompt) => self.prompt(prompt, &profile.name, &profile.connection),
+                        None if self.poll_cancellation() => AuthAnswer::Cancel,
+                        None => AuthAnswer::Trust(false),
+                    }
+                })?;
             self.sessions.insert(id.into(), session);
         }
-        let result = self
+        let mut session = self
             .sessions
-            .get_mut(id)
-            .unwrap()
-            .run_worker(WORKER, request);
-        if result.is_err() {
-            self.sessions.remove(id);
+            .remove(id)
+            .context("SSH session is unavailable")?;
+        let result = session.run_worker_cancellable(WORKER, request, || self.poll_cancellation());
+        if result.is_ok() && !self.operation_cancelled {
+            self.sessions.insert(id.into(), session);
         }
         result
     }
@@ -864,79 +935,85 @@ impl Backend {
         device: &str,
         connection: &ConnectionConfig,
     ) -> AuthAnswer {
+        if self.poll_cancellation() {
+            return AuthAnswer::Cancel;
+        }
         self.request += 1;
         let id = format!("auth-{}", self.request);
         let event = match prompt {
             AuthPrompt::TrustHost {
                 host,
-                port,
+                port: _,
                 fingerprint,
             } => Event::TrustHost {
                 request_id: id.clone(),
-                host: format!("{host}:{port}"),
+                host,
                 fingerprint,
             },
             AuthPrompt::Password { username } => Event::Authentication {
                 request_id: id.clone(),
                 prompt: format!(
-                    "SSH password for {username}@{}:{} ({device})",
-                    connection.host, connection.port
+                    "SSH password for {username} on {} ({device})",
+                    connection.host
                 ),
             },
             AuthPrompt::KeyPassphrase { key_path } => Event::Authentication {
                 request_id: id.clone(),
                 prompt: format!(
-                    "Key passphrase for {}. Connecting to {}@{}:{} ({device})",
+                    "Key passphrase for {}. Connecting to {} ({device})",
                     key_path.display(),
-                    connection.username,
-                    connection.host,
-                    connection.port
+                    connection.display_address()
                 ),
             },
         };
         if self.events.send(event).is_err() {
             return AuthAnswer::Cancel;
         }
-        while let Ok(command) = self.commands.recv() {
-            match command {
-                Command::TrustHost {
-                    request_id,
-                    accepted,
-                } if request_id == id => return AuthAnswer::Trust(accepted),
-                Command::Authenticate { request_id, secret } if request_id == id => {
-                    return AuthAnswer::Secret(secret);
+        let answer = (|| {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                let Ok(command) = self.commands.recv_timeout(remaining) else {
+                    break;
+                };
+                match command {
+                    Command::TrustHost {
+                        request_id,
+                        accepted,
+                    } if request_id == id => return AuthAnswer::Trust(accepted),
+                    Command::Authenticate { request_id, secret } if request_id == id => {
+                        return AuthAnswer::Secret(secret);
+                    }
+                    Command::CancelAuthentication { request_id } if request_id == id => {
+                        self.cancel_operation();
+                        return AuthAnswer::Cancel;
+                    }
+                    Command::CancelOperation | Command::CancelReview => {
+                        self.cancel_operation();
+                        return AuthAnswer::Cancel;
+                    }
+                    Command::Authenticate { secret, .. } => drop(secret),
+                    Command::TrustHost { .. } | Command::CancelAuthentication { .. } => {}
+                    command => self.pending.push_back(command),
                 }
-                Command::CancelAuthentication { request_id } if request_id == id => {
-                    return AuthAnswer::Cancel;
-                }
-                Command::Authenticate { secret, .. } => drop(secret),
-                command => self.pending.push_back(command),
             }
-        }
-        AuthAnswer::Cancel
+            self.cancel_operation();
+            AuthAnswer::Cancel
+        })();
+        let _ = self
+            .events
+            .send(Event::AuthenticationFinished { request_id: id });
+        answer
     }
 }
 fn safe_connection_error(error: &anyhow::Error) -> String {
     let text = error.to_string();
-    match text.as_str() {
-        "Host key changed. Connection blocked; verify the server independently"
-        | "Host identity was not accepted"
-        | "Cannot verify host identity"
-        | "Authentication cancelled"
-        | "SSH key authentication failed"
-        | "SSH password authentication failed"
-        | "SSH authentication failed"
-        | "Cannot resolve SSH host"
-        | "Cannot connect to SSH host"
-        | "SSH handshake failed"
-        | "Cannot start remote Node worker"
-        | "Cannot open SSH worker channel"
-        | "Cannot send remote request"
-        | "Cannot read remote worker response"
-        | "Remote request exceeds size limit" => text,
-        _ => explain("SSH_FAILED"),
+    if sync_core::transport::is_safe_error(&text) {
+        text
+    } else {
+        explain("SSH_FAILED")
     }
 }
+
 fn local_root() -> String {
     std::env::var("PI_CODING_AGENT_DIR").unwrap_or_else(|_| "~/.pi/agent".into())
 }
@@ -1201,7 +1278,147 @@ mod tests {
             plan: None,
             changes: HashMap::new(),
             request: 0,
+            operation_cancelled: false,
         }
+    }
+    #[test]
+    fn cancellation_preserves_fifo_commands_and_drops_stale_prompt_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = test_backend(dir.path());
+        let (tx, rx) = mpsc::channel();
+        backend.commands = rx;
+        backend.snapshot.plan_id = Some("old-plan".into());
+        backend.plan = Some(json!({"planId":"old-plan"}));
+        tx.send(Command::Refresh).unwrap();
+        tx.send(Command::Authenticate {
+            request_id: "stale".into(),
+            secret: Zeroizing::new("secret".into()),
+        })
+        .unwrap();
+        tx.send(Command::TrustHost {
+            request_id: "stale".into(),
+            accepted: true,
+        })
+        .unwrap();
+        tx.send(Command::CancelOperation).unwrap();
+        tx.send(Command::SelectSource("local".into())).unwrap();
+        assert!(backend.poll_cancellation());
+        assert!(backend.snapshot.plan_id.is_none());
+        assert!(backend.plan.is_none());
+        assert!(matches!(
+            backend.pending.pop_front(),
+            Some(Command::Refresh)
+        ));
+        assert!(matches!(
+            backend.pending.pop_front(),
+            Some(Command::SelectSource(_))
+        ));
+        assert!(backend.pending.is_empty());
+        assert!(
+            backend
+                .call(json!({"op":"apply"}))
+                .unwrap_err()
+                .to_string()
+                .contains("may have written")
+        );
+        assert!(backend.engine.is_none());
+        assert!(backend.apply("old-plan".into(), BTreeMap::new()).is_err());
+        assert!(
+            backend
+                .remote("next-target", &json!({}))
+                .unwrap_err()
+                .to_string()
+                .contains("Operation cancelled")
+        );
+        backend
+            .handle(Command::Authenticate {
+                request_id: "late".into(),
+                secret: Zeroizing::new("secret".into()),
+            })
+            .unwrap();
+        assert!(backend.operation_cancelled);
+        backend.handle(Command::Refresh).unwrap();
+        assert!(!backend.operation_cancelled);
+    }
+    #[test]
+    fn cancel_review_during_authentication_aborts_whole_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = test_backend(dir.path());
+        let (tx, rx) = mpsc::channel();
+        let (events, _received) = mpsc::channel();
+        backend.commands = rx;
+        backend.events = events;
+        tx.send(Command::CancelReview).unwrap();
+        let connection = ConnectionConfig::parse("ssh user@host").unwrap();
+        assert!(matches!(
+            backend.prompt(
+                AuthPrompt::Password {
+                    username: "user".into()
+                },
+                "Test",
+                &connection
+            ),
+            AuthAnswer::Cancel
+        ));
+        assert!(backend.operation_cancelled);
+        assert!(backend.pending.is_empty());
+    }
+    #[test]
+    fn emitted_prompt_always_finishes_when_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = test_backend(dir.path());
+        let (tx, rx) = mpsc::channel();
+        let (events, received) = mpsc::channel();
+        backend.commands = rx;
+        backend.events = events;
+        let observer = std::thread::spawn(move || {
+            let Event::Authentication { request_id, .. } =
+                received.recv_timeout(Duration::from_secs(3)).unwrap()
+            else {
+                panic!("expected authentication prompt");
+            };
+            tx.send(Command::CancelOperation).unwrap();
+            assert!(
+                matches!(received.recv_timeout(Duration::from_secs(3)).unwrap(),
+                Event::AuthenticationFinished { request_id: finished } if finished == request_id)
+            );
+        });
+        let connection = ConnectionConfig::parse("ssh user@host").unwrap();
+        assert!(matches!(
+            backend.prompt(
+                AuthPrompt::Password {
+                    username: "user".into()
+                },
+                "Test",
+                &connection
+            ),
+            AuthAnswer::Cancel
+        ));
+        observer.join().unwrap();
+        assert!(backend.operation_cancelled);
+    }
+    #[test]
+    fn busy_bridge_wait_can_be_cancelled_without_replaying_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = test_backend(dir.path());
+        let (tx, rx) = mpsc::channel();
+        backend.commands = rx;
+        backend.engine = Some(Engine::spawn().unwrap());
+        // An isolated output receiver guarantees this call is waiting, not a race
+        // against a fast real bridge response.
+        let (_output_tx, output_rx) = mpsc::channel();
+        backend.engine.as_mut().unwrap().output = output_rx;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            tx.send(Command::CancelOperation).unwrap();
+        });
+        let started = Instant::now();
+        let error = backend.call(json!({"op":"ping"})).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(error.to_string().contains("prepare a new review"));
+        assert!(backend.engine.is_none());
+        assert!(backend.sessions.is_empty());
+        assert!(backend.operation_cancelled);
     }
     #[test]
     fn startup_defaults_local_and_restores_saved_custom_scope_without_a_plan() {

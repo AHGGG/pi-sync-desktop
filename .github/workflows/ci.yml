@@ -33,9 +33,14 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc g++ clang cmake libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1
+          sudo apt-get install -y gcc g++ clang cmake libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1 openssh-client openssh-server
       - run: cargo fmt --all -- --check
       - run: cargo test --locked -p sync-core
+      - name: Native askpass process integration
+        run: node scripts/test-askpass.mjs
+      - name: Real OpenSSH transport and agent integration
+        if: runner.os == 'Linux'
+        run: scripts/test-ssh.sh
       - run: cargo test --locked -p pi-sync-desktop
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo build --locked --release -p pi-sync-desktop

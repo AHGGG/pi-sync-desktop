@@ -9,6 +9,9 @@ use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 
 fn main() {
+    if let Some(code) = sync_core::askpass::run_helper_if_requested() {
+        std::process::exit(code);
+    }
     let (commands, events) = backend::start();
     gpui_kit::application()
         .with_assets(assets::AppAssets)

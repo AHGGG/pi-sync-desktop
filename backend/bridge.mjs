@@ -11,11 +11,10 @@ const engine = new SyncEngine(
   (target, request) =>
     new Promise((resolve, reject) => {
       const transportId = String(++sequence);
-      const timer = setTimeout(() => {
-        pending.delete(transportId);
-        reject(new Error("SSH_TIMEOUT"));
-      }, 90000);
-      pending.set(transportId, { resolve, reject, timer });
+      // Rust owns connection/worker deadlines and cancellation. An independent
+      // timer here could discard an apply while its native authentication dialog
+      // is still open, then let the late authenticated request write unnoticed.
+      pending.set(transportId, { resolve, reject });
       write({ type: "transport", transportId, target, request });
     }),
 );
@@ -115,7 +114,6 @@ function line(text) {
   if (message.op === "transport-result") {
     const p = pending.get(String(message.transportId));
     if (!p) return;
-    clearTimeout(p.timer);
     pending.delete(String(message.transportId));
     if (message.error) p.reject(new Error("SSH_FAILED"));
     else p.resolve(message.response);
@@ -144,7 +142,6 @@ process.stdin.on("data", (chunk) => {
 process.stdin.on("end", () => {
   if (buffer.trim()) line(buffer);
   for (const p of pending.values()) {
-    clearTimeout(p.timer);
     p.reject(new Error("TRANSPORT_CLOSED"));
   }
   pending.clear();
