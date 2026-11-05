@@ -66,6 +66,11 @@ struct ReviewDiff {
     active: usize,
 }
 
+struct ReviewDestination {
+    change_id: String,
+    hunk: Option<usize>,
+}
+
 impl ReviewDiff {
     fn can_move(&self, forward: bool) -> bool {
         if forward {
@@ -904,9 +909,12 @@ impl Workspace {
         cx.notify();
     }
 
+    fn review_item_visible(&self, change: &Change) -> bool {
+        !self.review_pending_only || self.review_needs_decision(change)
+    }
+
     fn active_review_change(&self) -> Option<&Change> {
-        let visible =
-            |change: &&Change| !self.review_pending_only || self.review_needs_decision(change);
+        let visible = |change: &&Change| self.review_item_visible(change);
         self.snapshot
             .changes
             .iter()
@@ -915,34 +923,117 @@ impl Workspace {
             .or_else(|| self.snapshot.changes.iter().find(visible))
     }
 
-    fn move_review_hunk(&mut self, id: &str, forward: bool, cx: &mut Context<Self>) {
+    /// Traverse hunks before crossing the boundary to the adjacent visible item.
+    /// Resolve by change ID, not path: different targets can review the same file.
+    fn review_destination(&self, id: &str, forward: bool) -> Option<ReviewDestination> {
+        if self.active_review_change()?.id != id {
+            return None;
+        }
+        if let Some(diff) = self.review_diffs.get(id)
+            && diff.can_move(forward)
+        {
+            return Some(ReviewDestination {
+                change_id: id.to_owned(),
+                hunk: Some(if forward {
+                    diff.active + 1
+                } else {
+                    diff.active - 1
+                }),
+            });
+        }
+        let changes = &self.snapshot.changes;
+        let current = changes.iter().position(|change| change.id == id)?;
+        let next = if forward {
+            changes[current + 1..]
+                .iter()
+                .find(|change| self.review_item_visible(change))
+        } else {
+            changes[..current]
+                .iter()
+                .rev()
+                .find(|change| self.review_item_visible(change))
+        }?;
+        Some(ReviewDestination {
+            change_id: next.id.clone(),
+            hunk: self.review_diffs.get(&next.id).and_then(|diff| {
+                if forward {
+                    (!diff.hunks.is_empty()).then_some(0)
+                } else {
+                    diff.hunks.len().checked_sub(1)
+                }
+            }),
+        })
+    }
+
+    fn review_navigation_label(&self, id: &str, forward: bool) -> String {
+        match self.review_destination(id, forward) {
+            Some(destination) if destination.change_id == id => if forward {
+                "Next hunk in this item"
+            } else {
+                "Previous hunk in this item"
+            }
+            .into(),
+            Some(destination) => {
+                let change = self
+                    .snapshot
+                    .changes
+                    .iter()
+                    .find(|change| change.id == destination.change_id)
+                    .unwrap();
+                format!(
+                    "{} item: {} · {}",
+                    if forward { "Next" } else { "Previous" },
+                    change.path,
+                    change.device
+                )
+            }
+            None => if forward {
+                "End of visible review"
+            } else {
+                "Start of visible review"
+            }
+            .into(),
+        }
+    }
+
+    fn navigate_review(&mut self, id: &str, forward: bool, cx: &mut Context<Self>) {
         if self.busy.is_some() || self.snapshot.plan_id.is_none() {
             return;
         }
-        let Some(diff) = self.review_diffs.get_mut(id) else {
+        let Some(destination) = self.review_destination(id, forward) else {
             return;
         };
-        if !diff.can_move(forward) {
-            return;
+        if destination.change_id != id {
+            self.review_change_id = Some(destination.change_id.clone());
+            // A press begun on the old item cannot select content on the new one.
+            self.review_pointer = None;
+            self.review_pointer_blocked = true;
         }
-        diff.active = if forward {
-            diff.active + 1
-        } else {
-            diff.active - 1
-        };
-        if let Some(range) = diff.hunks[diff.active].first() {
-            let position = DiffLinePosition::new(range.path().clone(), range.side(), range.start());
-            diff.state
-                .update(cx, |state, cx| state.scroll_to_line(position, cx));
+        if let Some(hunk) = destination.hunk
+            && let Some(diff) = self.review_diffs.get_mut(&destination.change_id)
+        {
+            diff.active = hunk;
+            if let Some(range) = diff.hunks[hunk].first() {
+                let position =
+                    DiffLinePosition::new(range.path().clone(), range.side(), range.start());
+                diff.state
+                    .update(cx, |state, cx| state.scroll_to_line(position, cx));
+            }
         }
         cx.notify();
     }
 
     fn activate_review_edge(&mut self, id: &str, side: Choice, cx: &mut Context<Self>) {
         // An implicit default is not a first click. The edge always chooses
-        // before it navigates, and never changes the current review item.
+        // before it navigates. A destination item needs its own explicit choice.
+        if self
+            .active_review_change()
+            .is_none_or(|change| change.id != id)
+        {
+            return;
+        }
         if self.choices.get(id) == Some(&side) {
-            self.move_review_hunk(id, side == Choice::Target, cx);
+            self.navigate_review(id, side == Choice::Target, cx);
         } else {
             self.choose_review_side(id, side, cx);
         }
@@ -964,7 +1055,7 @@ impl Workspace {
         if let Some(side) = side {
             self.choose_review_side(&id, side, cx);
         } else {
-            self.move_review_hunk(&id, forward, cx);
+            self.navigate_review(&id, forward, cx);
         }
     }
 
@@ -1024,6 +1115,10 @@ impl Workspace {
             .unwrap_or_else(|| change.device.clone());
         let whole_file = change.id.contains(":files:") || change.path.starts_with("models.json");
         let diff = self.review_diffs.get(&change.id);
+        let previous = self.review_destination(&change.id, false);
+        let next = self.review_destination(&change.id, true);
+        let previous_label = self.review_navigation_label(&change.id, false);
+        let next_label = self.review_navigation_label(&change.id, true);
         let position_label = if let Some(diff) = diff {
             format!("Hunk {} of {}", diff.active + 1, diff.hunks.len())
         } else if self
@@ -1068,18 +1163,18 @@ impl Workspace {
                 .when(whole_file && diff.is_none(), |el| el.child(div().text_xs().text_color(cx.theme().muted_foreground).child("Safe preview")))
                 .child(div().id("review-hunk-position").test_support().text_xs().text_color(cx.theme().muted_foreground)
                     .aria_label(position_label.clone()).child(position_label)
-                    .tooltip(|window, cx| Tooltip::new("Hunks are groups of changed lines within this item. Choose another item in the sidebar.").build(window, cx)))
-                .when_some(diff, |el, diff| {
+                    .tooltip(|window, cx| Tooltip::new("Navigate through hunks, then continue to the next or previous visible review item.").build(window, cx)))
+                .when(diff.is_some() || previous.is_some() || next.is_some(), |el| {
                     let previous_id = change.id.clone();
                     let next_id = change.id.clone();
                     el.child(Button::new("previous-diff-hunk").small().ghost().label("↑")
-                        .accessibility_label("Previous hunk in this item").tooltip("Previous hunk in this item · Alt+↑")
-                        .disabled(self.busy.is_some() || !diff.can_move(false))
-                        .on_click(cx.listener(move |this, _, _, cx| this.move_review_hunk(&previous_id, false, cx))))
+                        .accessibility_label(previous_label.clone()).tooltip(format!("{previous_label} · Alt+↑"))
+                        .disabled(self.busy.is_some() || previous.is_none())
+                        .on_click(cx.listener(move |this, _, _, cx| this.navigate_review(&previous_id, false, cx))))
                       .child(Button::new("next-diff-hunk").small().ghost().label("↓")
-                        .accessibility_label("Next hunk in this item").tooltip("Next hunk in this item · Alt+↓")
-                        .disabled(self.busy.is_some() || !diff.can_move(true))
-                        .on_click(cx.listener(move |this, _, _, cx| this.move_review_hunk(&next_id, true, cx))))
+                        .accessibility_label(next_label.clone()).tooltip(format!("{next_label} · Alt+↓"))
+                        .disabled(self.busy.is_some() || next.is_none())
+                        .on_click(cx.listener(move |this, _, _, cx| this.navigate_review(&next_id, true, cx))))
                 })
                 .child(Button::new("use-source-all").small().label("Use source for all changes →")
                     .tooltip(format!("Select source for {eligible} changes. {unavailable} unavailable sources are excluded. Nothing is written until you confirm sync."))
@@ -1169,33 +1264,13 @@ impl Workspace {
     ) -> impl IntoElement {
         let source = side == Choice::Source;
         let selected = self.choices.get(&change.id) == Some(&side);
-        let can_move = self
-            .review_diffs
-            .get(&change.id)
-            .is_some_and(|diff| diff.can_move(!source));
-        let action = if selected {
-            if source {
-                "Previous hunk in this item"
-            } else {
-                "Next hunk in this item"
-            }
+        let can_move = self.review_destination(&change.id, !source).is_some();
+        let label = if selected {
+            self.review_navigation_label(&change.id, !source)
         } else if source {
-            "Choose source version first"
+            "Choose source version first".into()
         } else {
-            "Choose target version first"
-        };
-        let label = if selected && !can_move {
-            if self.review_diffs.contains_key(&change.id) {
-                if source {
-                    "First hunk in this item"
-                } else {
-                    "Last hunk in this item"
-                }
-            } else {
-                "No navigable text preview"
-            }
-        } else {
-            action
+            "Choose target version first".into()
         };
         let id = change.id.clone();
         let hovered = self.review_hovered_side == Some(side);
@@ -1245,7 +1320,7 @@ impl Workspace {
                     })
                     .size(px(24.)),
                 )
-                .accessibility_label(label)
+                .accessibility_label(label.clone())
                 .tooltip(label)
                 .disabled(
                     self.busy.is_some()
@@ -1447,13 +1522,9 @@ impl Workspace {
         let changes = &self.snapshot.changes;
         let visible: Vec<_> = changes
             .iter()
-            .filter(|change| !self.review_pending_only || self.review_needs_decision(change))
+            .filter(|change| self.review_item_visible(change))
             .collect();
-        let active = visible
-            .iter()
-            .copied()
-            .find(|change| self.review_change_id.as_ref() == Some(&change.id))
-            .or_else(|| visible.first().copied());
+        let active = self.active_review_change();
         let copies = changes
             .iter()
             .filter(|change| {

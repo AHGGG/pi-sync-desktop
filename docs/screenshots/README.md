@@ -27,3 +27,5 @@ Headless interaction tests separately exercise production controls, onboarding,
 remembered selection, cancellation, keyboard review, authentication, and single-shot
 confirmation. Real desktop smoke testing on macOS, Windows and a visible Linux session
 is still required before calling those platforms runtime-verified.
+
+`--fixture-next-file` extends the synthetic navigation fixture with a second text file. It verifies reaching the final hunk, then crossing to the next file on a separate click without choosing its version.

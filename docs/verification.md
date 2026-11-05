@@ -1,5 +1,11 @@
 # Verification record
 
+## Hunk-to-item boundary navigation · 2026-11-05
+
+- `cargo test --locked --workspace`: 62 desktop tests, 25 core tests and the fixture-diagnostic test passed locally on Linux. Six new production-view tests cover boundary-only item transitions, first/last entry for revisited items, select-first overlays on each item, Pending and duplicate paths across targets, opaque/equal/unavailable previews, busy/dialog/no-plan guards, visible offscreen reverse entry, and navigation during a held content/overlay/top-button press. No navigation test emits a backend command.
+- Workspace/all-targets/all-features Clippy with warnings denied, formatting, public-source scan, and all 143 backend tests passed. The native GPUI/WGPU `--fixture-next-file` scenario verifies two hunk steps followed by an extra click to a new unchosen file. No live connection or sync was performed.
+- The first local workspace run hit a Broken pipe in the existing 250 ms fragmented askpass test. An unchanged full-workspace rerun passed; transport code was not modified. Opt-in helper-process and real-SSH tests remain outside this local UI run. Remote CI is checked separately for the published commit.
+
 ## Content-pane selection and hunk navigation · 2026-11-05
 
 - `cargo test --locked --workspace`: 56 desktop tests, 25 core tests and the standalone fixture-diagnostic test passed in Linux. The opt-in native-helper and real-SSH tests remained ignored in this run; transport code was not changed.

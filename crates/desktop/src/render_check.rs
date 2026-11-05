@@ -7,7 +7,7 @@ mod ui_model;
 mod workspace;
 
 use gpui_kit::component::{Theme, ThemeMode};
-use gpui_kit::test::TestWindowExt;
+use gpui_kit::test::{TestQueryExt, TestWindowExt};
 use gpui_kit::{AppContext, Bounds, HeadlessAppContext, WindowBounds, WindowOptions, px, size};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -27,8 +27,10 @@ fn main() -> anyhow::Result<()> {
             "--fixture-overlay-idle" | "--fixture-overlay-hover" | "--fixture-overlay-selected"
         )
     });
-    let fixture_navigation =
-        fixture_overlay.is_some() || std::env::args().any(|arg| arg == "--fixture-navigation");
+    let fixture_next_file = std::env::args().any(|arg| arg == "--fixture-next-file");
+    let fixture_navigation = fixture_next_file
+        || fixture_overlay.is_some()
+        || std::env::args().any(|arg| arg == "--fixture-navigation");
     let fixture_review =
         fixture_navigation || std::env::args().any(|arg| arg == "--fixture-review");
     if fixture_review {
@@ -69,6 +71,25 @@ fn main() -> anyhow::Result<()> {
         snapshot
             .text_previews
             .insert(snapshot.changes[1].id.clone(), (target, source));
+        if fixture_next_file {
+            let id = "example:files:extensions/next.ts".to_string();
+            snapshot.changes.push(ui_model::Change {
+                id: id.clone(),
+                device: "Example workstation (fixture)".into(),
+                path: "extensions/next.ts · entire file".into(),
+                before: "Synthetic target preview".into(),
+                after: "Synthetic source preview".into(),
+                conflict: true,
+                source_available: true,
+            });
+            snapshot.text_previews.insert(
+                id,
+                (
+                    "export const enabled = false;\n".into(),
+                    "export const enabled = true;\n".into(),
+                ),
+            );
+        }
     }
     let mut context = HeadlessAppContext::with_platform(
         gpui_kit::platform::current_platform(true).text_system(),
@@ -174,6 +195,24 @@ fn main() -> anyhow::Result<()> {
                 window.render_frame(cx);
                 window.click("review-target-edge", cx);
                 window.click("review-target-edge", cx);
+                if fixture_next_file {
+                    window.click("review-target-edge", cx);
+                    assert!(!window.find_all_by_label("Hunk 3 of 3").is_empty());
+                    window.click("review-target-edge", cx);
+                    assert!(
+                        !window
+                            .find_all("choose-target-example:files:extensions/next.ts")
+                            .is_empty()
+                    );
+                    assert!(!window.find_all_by_label("Hunk 1 of 1").is_empty());
+                    assert_ne!(
+                        window
+                            .find("choose-target-example:files:extensions/next.ts")
+                            .checked(),
+                        Some(true)
+                    );
+                    assert_eq!(window.find("apply-reviewed").disabled(), Some(true));
+                }
             }
         }
     })?;

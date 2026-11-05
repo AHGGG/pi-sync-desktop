@@ -1399,7 +1399,7 @@ fn navigation_reveals_offscreen_hunks_and_preserves_copy_selection(cx: &mut Test
             )
         });
         assert_eq!(state.read(cx).selected_text(cx), "source 0\nsource 1\n");
-        view.update(cx, |view, cx| view.move_review_hunk(id, true, cx));
+        view.update(cx, |view, cx| view.navigate_review(id, true, cx));
         window.render_frame(cx);
         let body = window.find("review-code-surface").bounds();
         let last = window.find_by_label("final source hunk").bounds();
@@ -1532,6 +1532,401 @@ fn transparent_arrows_follow_pane_hover_and_keyboard_focus_without_layout_shift(
         window.press("enter", cx);
         assert_eq!(view.read(cx).review_diffs[id].active, 0);
         assert_eq!(window.find("review-source-edge").disabled(), Some(true));
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn review_navigation_crosses_items_only_after_final_hunk(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    let first = "target:files:first.txt";
+    let second = "target:files:second.txt";
+    let (source, target) = separated_hunks();
+    cx.update_window(handle, |_, window, cx| {
+        review_snapshot(
+            &view,
+            vec![
+                review_change(first, "first.txt", true),
+                review_change(second, "second.txt", true),
+            ],
+            vec![(first, &target, &source), (second, &target, &source)],
+            window,
+            cx,
+        );
+        for hunk in 1..3 {
+            window.click("next-diff-hunk", cx);
+            assert_eq!(view.read(cx).active_review_change().unwrap().id, first);
+            assert_eq!(view.read(cx).review_diffs[first].active, hunk);
+        }
+        assert!(
+            !window
+                .find_all_by_label("Next item: second.txt · Target")
+                .is_empty()
+        );
+        assert_ne!(window.find("next-diff-hunk").disabled(), Some(true));
+        window.click("next-diff-hunk", cx);
+        assert_eq!(view.read(cx).active_review_change().unwrap().id, second);
+        assert_eq!(view.read(cx).review_diffs[second].active, 0);
+        window.click("next-diff-hunk", cx);
+        assert_eq!(view.read(cx).review_diffs[second].active, 1);
+        window.click("review-item-target:files:first.txt", cx);
+        window.click("next-diff-hunk", cx);
+        assert_eq!(
+            view.read(cx).review_diffs[second].active,
+            0,
+            "forward entry resets a previously visited item's hunk"
+        );
+        window.click("previous-diff-hunk", cx);
+        assert_eq!(view.read(cx).active_review_change().unwrap().id, first);
+        assert_eq!(
+            view.read(cx).review_diffs[first].active,
+            2,
+            "reverse entry starts at the final hunk"
+        );
+        for _ in 0..2 {
+            window.press("alt-up", cx);
+        }
+        assert_eq!(window.find("previous-diff-hunk").disabled(), Some(true));
+        window.press("alt-up", cx);
+        assert_eq!(view.read(cx).active_review_change().unwrap().id, first);
+        assert_eq!(view.read(cx).review_diffs[first].active, 0);
+        for _ in 0..5 {
+            window.press("alt-down", cx);
+        }
+        assert_eq!(view.read(cx).active_review_change().unwrap().id, second);
+        assert_eq!(view.read(cx).review_diffs[second].active, 2);
+        assert_eq!(window.find("next-diff-hunk").disabled(), Some(true));
+        window.press("alt-down", cx);
+        assert_eq!(
+            view.read(cx).review_diffs[second].active,
+            2,
+            "end of review does not wrap"
+        );
+        assert!(view.read(cx).choices.is_empty());
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn review_edges_choose_each_item_before_crossing_its_boundary(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    let first = "target:files:first.txt";
+    let second = "target:files:second.txt";
+    cx.update_window(handle, |_, window, cx| {
+        let mut automatic = review_change(first, "first.txt", true);
+        automatic.conflict = false;
+        review_snapshot(
+            &view,
+            vec![automatic, review_change(second, "second.txt", true)],
+            vec![
+                (first, "old\n", "new\n"),
+                (second, "old two\n", "new two\n"),
+            ],
+            window,
+            cx,
+        );
+        click_review_edge(window, false, cx);
+        assert_eq!(view.read(cx).choices[first], Choice::Target);
+        assert_eq!(view.read(cx).active_review_change().unwrap().id, first);
+        click_review_edge(window, false, cx);
+        assert_eq!(view.read(cx).active_review_change().unwrap().id, second);
+        assert!(!view.read(cx).choices.contains_key(second));
+        assert!(
+            window.find("review-target-edge").visible(),
+            "hover overlay remains discoverable across the transition"
+        );
+        click_review_edge(window, false, cx);
+        assert_eq!(view.read(cx).choices[second], Choice::Target);
+        assert_eq!(window.find("review-target-edge").disabled(), Some(true));
+        click_review_edge(window, true, cx);
+        assert_eq!(view.read(cx).choices[second], Choice::Source);
+        assert_eq!(view.read(cx).active_review_change().unwrap().id, second);
+        click_review_edge(window, true, cx);
+        assert_eq!(view.read(cx).active_review_change().unwrap().id, first);
+        assert_eq!(
+            view.read(cx).choices[first],
+            Choice::Target,
+            "navigation never copies the other item's choice"
+        );
+        click_review_edge(window, true, cx);
+        assert_eq!(view.read(cx).choices[first], Choice::Source);
+        assert_eq!(window.find("review-source-edge").disabled(), Some(true));
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn boundary_navigation_uses_pending_order_and_stable_target_ids(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    let first = "target:files:same.txt";
+    let automatic = "target:settings:/automatic";
+    let second = "other:files:same.txt";
+    let resolved = "other:settings:/resolved";
+    let last = "other:models:/";
+    cx.update_window(handle, |_, window, cx| {
+        let mut implicit = review_change(automatic, "settings.json/automatic", true);
+        implicit.conflict = false;
+        let mut other = review_change(second, "same.txt", true);
+        other.device = "Other target".into();
+        review_snapshot(
+            &view,
+            vec![
+                review_change(first, "same.txt", true),
+                implicit,
+                other,
+                review_change(resolved, "settings.json/resolved", true),
+                review_change(last, "models.json · private file", false),
+            ],
+            vec![(first, "old\n", "new\n"), (second, "old\n", "new\n")],
+            window,
+            cx,
+        );
+        view.update(cx, |view, _| {
+            view.choices.insert(resolved.into(), Choice::Target);
+        });
+        window.click("review-pending", cx);
+        assert_eq!(view.read(cx).active_review_change().unwrap().id, first);
+        window.click("next-diff-hunk", cx);
+        assert_eq!(
+            view.read(cx).active_review_change().unwrap().id,
+            second,
+            "same path on a different target is a distinct item"
+        );
+        window.press("alt-down", cx);
+        assert_eq!(
+            view.read(cx).active_review_change().unwrap().id,
+            last,
+            "resolved and implicit decisions are skipped"
+        );
+        window.press("alt-up", cx);
+        assert_eq!(view.read(cx).active_review_change().unwrap().id, second);
+        click_review_edge(window, false, cx);
+        assert_eq!(view.read(cx).choices[second], Choice::Target);
+        assert_eq!(
+            view.read(cx).active_review_change().unwrap().id,
+            first,
+            "choosing removes only this item; no second navigation runs"
+        );
+        view.update(cx, |view, cx| {
+            view.navigate_review(second, true, cx);
+            view.activate_review_edge(second, Choice::Source, cx);
+        });
+        assert_eq!(
+            view.read(cx).choices[second],
+            Choice::Target,
+            "a stale item callback cannot change the removed item"
+        );
+        assert!(!view.read(cx).choices.contains_key(first));
+        click_review_edge(window, false, cx);
+        assert_eq!(view.read(cx).active_review_change().unwrap().id, last);
+        assert!(!view.read(cx).choices.contains_key(last));
+        click_review_edge(window, false, cx);
+        assert!(view.read(cx).active_review_change().is_none());
+        window.press("alt-down", cx);
+        window.press("alt-up", cx);
+        assert!(window.find_all("next-diff-hunk").is_empty());
+        assert_eq!(view.read(cx).choices.len(), 4);
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn boundary_navigation_traverses_safe_previews_without_choices_or_writes(cx: &mut TestAppContext) {
+    use gpui_kit::component::WindowExt;
+    let (handle, view, received) = window(cx, true);
+    let ids = [
+        "target:files:first.txt",
+        "target:models:/",
+        "target:files:equal.txt",
+        "target:files:unavailable.txt",
+        "target:files:last.txt",
+    ];
+    cx.update_window(handle, |_, window, cx| {
+        review_snapshot(
+            &view,
+            vec![
+                review_change(ids[0], "first.txt", true),
+                review_change(ids[1], "models.json · private file", true),
+                review_change(ids[2], "equal.txt", true),
+                review_change(ids[3], "unavailable.txt", false),
+                review_change(ids[4], "last.txt", true),
+            ],
+            vec![
+                (ids[0], "old\n", "new\n"),
+                (ids[2], "same\n", "same\n"),
+                (ids[4], "old\n", "new\n"),
+            ],
+            window,
+            cx,
+        );
+        view.update(cx, |view, _| view.busy = Some("Working".into()));
+        window.render_frame(cx);
+        window.press("alt-down", cx);
+        assert_eq!(view.read(cx).active_review_change().unwrap().id, ids[0]);
+        view.update(cx, |view, _| view.busy = None);
+        window.open_alert_dialog(cx, |dialog, _, _| dialog.title("Test dialog").confirm());
+        window.render_frame(cx);
+        window.press("alt-down", cx);
+        assert_eq!(view.read(cx).active_review_change().unwrap().id, ids[0]);
+        window.within("dialog").click("cancel", cx);
+        for id in &ids[1..] {
+            window.click("next-diff-hunk", cx);
+            assert_eq!(&view.read(cx).active_review_change().unwrap().id, id);
+            assert!(
+                !window.find_all("previous-diff-hunk").is_empty(),
+                "safe previews still expose navigation"
+            );
+            if *id == ids[3] {
+                assert_eq!(window.find("review-source-edge").disabled(), Some(true));
+            }
+        }
+        for id in ids[..4].iter().rev() {
+            window.press("alt-up", cx);
+            assert_eq!(&view.read(cx).active_review_change().unwrap().id, id);
+        }
+        assert!(view.read(cx).choices.is_empty());
+        view.update(cx, |view, _| view.snapshot.plan_id = None);
+        view.update(cx, |view, cx| view.navigate_review(ids[0], true, cx));
+        assert_eq!(
+            view.read(cx).active_review_change().unwrap().id,
+            ids[0],
+            "no plan means no navigation"
+        );
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn entering_previous_item_reveals_its_last_hunk(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    let first = "target:files:long.txt";
+    let second = "target:files:short.txt";
+    let unchanged = (0..10)
+        .map(|i| format!("context {i}\n"))
+        .collect::<String>();
+    let source = format!(
+        "{}{unchanged}last source hunk\n",
+        (0..90).map(|i| format!("source {i}\n")).collect::<String>()
+    );
+    let target = format!(
+        "{}{unchanged}last target hunk\n",
+        (0..90).map(|i| format!("target {i}\n")).collect::<String>()
+    );
+    cx.update_window(handle, |_, window, cx| {
+        review_snapshot(
+            &view,
+            vec![
+                review_change(first, "long.txt", true),
+                review_change(second, "short.txt", true),
+            ],
+            vec![(first, &target, &source), (second, "old\n", "new\n")],
+            window,
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("review-item-target:files:short.txt", cx);
+        window.click("previous-diff-hunk", cx);
+        assert_eq!(view.read(cx).active_review_change().unwrap().id, first);
+        assert_eq!(view.read(cx).review_diffs[first].active, 1);
+        let body = window.find("review-code-surface").bounds();
+        let anchor = window.find_by_label("last source hunk").bounds();
+        assert!(
+            anchor.top() >= body.top() && anchor.bottom() <= body.bottom(),
+            "previous item's final hunk must actually be visible"
+        );
+        window.click("next-diff-hunk", cx);
+        window.click("review-item-target:files:long.txt", cx);
+        window.click("previous-diff-hunk", cx);
+        window.click("next-diff-hunk", cx);
+        window.click("next-diff-hunk", cx);
+        assert_eq!(view.read(cx).active_review_change().unwrap().id, second);
+        assert!(view.read(cx).choices.is_empty());
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn changing_review_item_during_a_press_cannot_choose_the_destination(cx: &mut TestAppContext) {
+    use gpui_kit::{MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput};
+    let (handle, view, received) = window(cx, true);
+    let first = "target:files:first.txt";
+    let second = "target:files:second.txt";
+    cx.update_window(handle, |_, window, cx| {
+        review_snapshot(
+            &view,
+            vec![
+                review_change(first, "first.txt", true),
+                review_change(second, "second.txt", true),
+                review_change("target:files:third.txt", "third.txt", true),
+            ],
+            vec![
+                (first, "old\n", "new\n"),
+                (second, "old two\n", "new two\n"),
+                ("target:files:third.txt", "old three\n", "new three\n"),
+            ],
+            window,
+            cx,
+        );
+        for control in ["content", "review-target-edge", "next-diff-hunk"] {
+            view.update(cx, |view, cx| {
+                view.review_change_id = None;
+                cx.notify();
+            });
+            window.render_frame(cx);
+            let body = window.find("review-code-surface").bounds();
+            let content = gpui_kit::point(
+                body.left() + body.size.width * 0.75,
+                body.bottom() - px(20.),
+            );
+            hover_point(window, content, cx);
+            let position = if control == "content" {
+                content
+            } else {
+                window.find(control).bounds().center()
+            };
+            hover_point(window, position, cx);
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    position,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            window.render_frame(cx);
+            window.press("alt-down", cx);
+            assert_eq!(view.read(cx).active_review_change().unwrap().id, second);
+            window.dispatch_event(
+                PlatformInput::MouseUp(MouseUpEvent {
+                    position,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            window.render_frame(cx);
+            assert_eq!(
+                view.read(cx).active_review_change().unwrap().id,
+                second,
+                "old press cannot advance an extra item ({control})"
+            );
+            assert!(
+                view.read(cx).choices.is_empty(),
+                "old press must not choose new content ({control})"
+            );
+        }
         assert!(received.try_recv().is_err());
     })
     .unwrap();
