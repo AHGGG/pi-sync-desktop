@@ -274,6 +274,44 @@ mod tests {
     fn config() -> ConnectionConfig {
         ConnectionConfig::parse("ssh pi@example.com").unwrap()
     }
+    const TEST_IO_TIMEOUT: Duration = Duration::from_secs(2);
+
+    fn connect_client(bridge: &Askpass) -> TcpStream {
+        let stream =
+            TcpStream::connect_timeout(&bridge.listener.local_addr().unwrap(), TEST_IO_TIMEOUT)
+                .unwrap();
+        stream.set_read_timeout(Some(TEST_IO_TIMEOUT)).unwrap();
+        stream.set_write_timeout(Some(TEST_IO_TIMEOUT)).unwrap();
+        stream
+    }
+
+    // A nonblocking poll can legitimately return false before accept is ready.
+    // Wait for actual processing, not merely a false result that also denotes
+    // successful authentication. Client I/O is bounded separately above.
+    fn poll_request(
+        bridge: &mut Askpass,
+        prompt: &mut impl FnMut(AuthPrompt) -> AuthAnswer,
+    ) -> bool {
+        let deadline = Instant::now() + TEST_IO_TIMEOUT;
+        loop {
+            let mut prompted = false;
+            let cancelled = bridge
+                .poll(&mut |request| {
+                    prompted = true;
+                    prompt(request)
+                })
+                .unwrap();
+            if prompted || cancelled {
+                return cancelled;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "askpass request was not serviced"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn host_prompt() -> String {
         format!(
             "The authenticity of host 'example.com (127.0.0.1)' can't be established.\nED25519 key fingerprint is SHA256:{}.\nThis key is not known by any other names.\nAre you sure you want to continue connecting (yes/no/[fingerprint])? ",
@@ -329,7 +367,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let mut stream = TcpStream::connect(bridge.listener.local_addr().unwrap()).unwrap();
+        let mut stream = connect_client(&bridge);
         stream.write_all(&[0; 32]).unwrap();
         assert!(!bridge.poll(&mut |_| panic!("untrusted prompt")).unwrap());
     }
@@ -345,17 +383,15 @@ mod tests {
                 }),
             )
             .unwrap();
-            let mut stream = TcpStream::connect(bridge.listener.local_addr().unwrap()).unwrap();
+            let mut stream = connect_client(&bridge);
             stream.write_all(&*bridge.capability).unwrap();
             write_frame(&mut stream, b"pi@example.com's password: ").unwrap();
             assert_eq!(
-                bridge
-                    .poll(&mut |_| if cancel {
-                        AuthAnswer::Cancel
-                    } else {
-                        AuthAnswer::Secret(Zeroizing::new("test-secret".into()))
-                    })
-                    .unwrap(),
+                poll_request(&mut bridge, &mut |_| if cancel {
+                    AuthAnswer::Cancel
+                } else {
+                    AuthAnswer::Secret(Zeroizing::new("test-secret".into()))
+                }),
                 cancel
             );
             let mut status = [0];
@@ -392,7 +428,7 @@ mod tests {
     #[test]
     fn fragmented_authenticated_request_waits_within_deadline() {
         let mut bridge = bridge();
-        let mut stream = TcpStream::connect(bridge.listener.local_addr().unwrap()).unwrap();
+        let mut stream = connect_client(&bridge);
         let capability = bridge.capability.clone();
         stream.write_all(&capability[..16]).unwrap();
         let client = std::thread::spawn(move || {
@@ -408,13 +444,38 @@ mod tests {
                 b"fixture answer"
             );
         });
-        assert!(
-            !bridge
-                .poll(&mut |_| AuthAnswer::Secret(Zeroizing::new("fixture answer".into())))
-                .unwrap()
-        );
+        assert!(!poll_request(&mut bridge, &mut |_| {
+            AuthAnswer::Secret(Zeroizing::new("fixture answer".into()))
+        }));
         client.join().unwrap();
     }
+    #[test]
+    fn delayed_connection_is_serviced_before_reading_the_response() {
+        let mut bridge = bridge();
+        assert!(!bridge.poll(&mut |_| panic!("no client yet")).unwrap());
+        let endpoint = bridge.listener.local_addr().unwrap();
+        let capability = bridge.capability.clone();
+        let client = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let mut stream = TcpStream::connect_timeout(&endpoint, TEST_IO_TIMEOUT).unwrap();
+            stream.set_read_timeout(Some(TEST_IO_TIMEOUT)).unwrap();
+            stream.set_write_timeout(Some(TEST_IO_TIMEOUT)).unwrap();
+            stream.write_all(&*capability).unwrap();
+            write_frame(&mut stream, b"pi@example.com's password:").unwrap();
+            let mut status = [0];
+            stream.read_exact(&mut status).unwrap();
+            assert_eq!(status, [1]);
+            assert_eq!(
+                &**read_frame(&mut stream, MAX_SECRET).unwrap(),
+                b"delayed answer"
+            );
+        });
+        assert!(!poll_request(&mut bridge, &mut |_| {
+            AuthAnswer::Secret(Zeroizing::new("delayed answer".into()))
+        }));
+        client.join().unwrap();
+    }
+
     #[test]
     fn rejects_wrong_answer_types_and_multiline_secrets() {
         for (raw, answer) in [
@@ -430,11 +491,11 @@ mod tests {
             ),
         ] {
             let mut bridge = bridge();
-            let mut stream = TcpStream::connect(bridge.listener.local_addr().unwrap()).unwrap();
+            let mut stream = connect_client(&bridge);
             stream.write_all(&*bridge.capability).unwrap();
             write_frame(&mut stream, raw.as_bytes()).unwrap();
             let mut answer = Some(answer);
-            assert!(bridge.poll(&mut |_| answer.take().unwrap()).unwrap());
+            assert!(poll_request(&mut bridge, &mut |_| answer.take().unwrap()));
             let mut status = [255];
             stream.read_exact(&mut status).unwrap();
             assert_eq!(status, [0]);
@@ -443,17 +504,13 @@ mod tests {
     #[test]
     fn explicit_host_acceptance_returns_yes() {
         let mut bridge = bridge();
-        let mut stream = TcpStream::connect(bridge.listener.local_addr().unwrap()).unwrap();
+        let mut stream = connect_client(&bridge);
         stream.write_all(&*bridge.capability).unwrap();
         write_frame(&mut stream, host_prompt().as_bytes()).unwrap();
-        assert!(
-            !bridge
-                .poll(&mut |prompt| {
-                    assert!(matches!(prompt, AuthPrompt::TrustHost { .. }));
-                    AuthAnswer::Trust(true)
-                })
-                .unwrap()
-        );
+        assert!(!poll_request(&mut bridge, &mut |prompt| {
+            assert!(matches!(prompt, AuthPrompt::TrustHost { .. }));
+            AuthAnswer::Trust(true)
+        }));
         let mut status = [0];
         stream.read_exact(&mut status).unwrap();
         assert_eq!(status, [1]);
@@ -467,20 +524,18 @@ mod tests {
             frame
         }] {
             let mut bridge = bridge();
-            let mut stream = TcpStream::connect(bridge.listener.local_addr().unwrap()).unwrap();
+            let mut stream = connect_client(&bridge);
             stream.write_all(&*bridge.capability).unwrap();
             stream.write_all(&bytes).unwrap();
-            assert!(
-                bridge
-                    .poll(&mut |_| panic!("unknown prompt displayed"))
-                    .unwrap()
-            );
+            assert!(poll_request(&mut bridge, &mut |_| panic!(
+                "unknown prompt displayed"
+            )));
         }
     }
     #[test]
     fn stalled_local_peer_is_bounded() {
         let mut bridge = bridge();
-        let _stream = TcpStream::connect(bridge.listener.local_addr().unwrap()).unwrap();
+        let _stream = connect_client(&bridge);
         let start = Instant::now();
         assert!(
             !bridge
