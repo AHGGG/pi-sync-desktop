@@ -916,6 +916,16 @@ fn click_review_edge(window: &mut gpui_kit::Window, source: bool, cx: &mut gpui_
     );
 }
 
+fn click_review_content(window: &mut gpui_kit::Window, source: bool, cx: &mut gpui_kit::App) {
+    let body = window.find("review-code-surface").bounds();
+    let point = gpui_kit::point(
+        body.left() + body.size.width * if source { 0.25 } else { 0.75 },
+        body.bottom() - px(20.),
+    );
+    hover_point(window, point, cx);
+    click_point(window, point, cx);
+}
+
 fn separated_hunks() -> (String, String) {
     let context = (0..10)
         .map(|ix| format!("unchanged {ix}\n"))
@@ -975,16 +985,14 @@ fn review_hunks_have_visible_position_and_bounded_navigation(cx: &mut TestAppCon
 }
 
 #[gpui_kit::test]
-fn content_blank_space_and_outer_edges_choose_before_navigating(cx: &mut TestAppContext) {
+fn content_choices_and_overlay_navigation_are_independent(cx: &mut TestAppContext) {
     let (handle, view, received) = window(cx, true);
     let id = "target:files:three.txt";
     let (source, target) = separated_hunks();
     cx.update_window(handle, |_, window, cx| {
-        let mut change = review_change(id, "three.txt", true);
-        change.conflict = false; // Default source must not arm the first edge click.
         review_snapshot(
             &view,
-            vec![change],
+            vec![review_change(id, "three.txt", true)],
             vec![(id, &target, &source)],
             window,
             cx,
@@ -994,48 +1002,43 @@ fn content_blank_space_and_outer_edges_choose_before_navigating(cx: &mut TestApp
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
-        window.click("next-diff-hunk", cx);
-        click_review_edge(window, true, cx);
+        assert_eq!(window.find("review-source-edge").disabled(), Some(true));
+        click_review_edge(window, false, cx);
+        assert_eq!(view.read(cx).review_diffs[id].active, 1);
+        assert!(
+            view.read(cx).choices.is_empty(),
+            "an undecided arrow only navigates"
+        );
+        assert_eq!(window.find("apply-reviewed").disabled(), Some(true));
+        click_review_content(window, true, cx);
         assert_eq!(view.read(cx).choices[id], Choice::Source);
-        assert_eq!(view.read(cx).review_diffs[id].active, 1);
-        click_review_edge(window, true, cx);
-        assert_eq!(view.read(cx).review_diffs[id].active, 0);
-        click_review_edge(window, false, cx);
-        assert_eq!(view.read(cx).choices[id], Choice::Target);
-        assert_eq!(view.read(cx).review_diffs[id].active, 0);
-        click_review_edge(window, false, cx);
-        assert_eq!(view.read(cx).review_diffs[id].active, 1);
-        let body = window.find("review-code-surface").bounds();
-        click_point(
-            window,
-            gpui_kit::point(
-                body.left() + body.size.width * 0.25,
-                body.bottom() - px(20.),
-            ),
-            cx,
-        );
-        assert_eq!(
-            view.read(cx).choices[id],
-            Choice::Source,
-            "blank source pane chooses source"
-        );
-        click_point(
-            window,
-            gpui_kit::point(
-                body.left() + body.size.width * 0.75,
-                body.bottom() - px(20.),
-            ),
-            cx,
-        );
-        assert_eq!(
-            view.read(cx).choices[id],
-            Choice::Target,
-            "blank target pane chooses target"
-        );
         assert_eq!(
             view.read(cx).review_diffs[id].active,
             1,
-            "ordinary content never navigates"
+            "content never navigates"
+        );
+        click_review_edge(window, false, cx);
+        assert_eq!(view.read(cx).review_diffs[id].active, 2);
+        assert_eq!(
+            view.read(cx).choices[id],
+            Choice::Source,
+            "right arrow must preserve a source choice"
+        );
+        assert_eq!(window.find("review-target-edge").disabled(), Some(true));
+        click_review_edge(window, false, cx);
+        assert_eq!(
+            view.read(cx).choices[id],
+            Choice::Source,
+            "disabled arrow must not choose the content beneath it"
+        );
+        click_review_content(window, false, cx);
+        assert_eq!(view.read(cx).choices[id], Choice::Target);
+        click_review_edge(window, true, cx);
+        assert_eq!(view.read(cx).review_diffs[id].active, 1);
+        assert_eq!(
+            view.read(cx).choices[id],
+            Choice::Target,
+            "left arrow must preserve a target choice"
         );
         assert!(received.try_recv().is_err());
     })
@@ -1349,7 +1352,8 @@ fn pure_add_delete_hidden_and_unavailable_previews_are_safe(cx: &mut TestAppCont
             cx,
         );
         assert!(!view.read(cx).choices.contains_key(private_id));
-        click_review_edge(window, false, cx);
+        assert_eq!(window.find("review-target-edge").disabled(), Some(true));
+        click_review_content(window, false, cx);
         assert_eq!(view.read(cx).choices[private_id], Choice::Target);
         assert_eq!(window.find("review-target-edge").disabled(), Some(true));
         assert!(received.try_recv().is_err());
@@ -1480,6 +1484,7 @@ fn transparent_arrows_follow_pane_hover_and_keyboard_focus_without_layout_shift(
             cx,
         );
         window.click("next-diff-hunk", cx);
+        window.click("next-diff-hunk", cx);
         hover_point(window, gpui_kit::point(px(100.), px(30.)), cx);
         assert!(window.find_all("review-interaction-hint").is_empty());
         let body = window.find("review-code-surface").bounds();
@@ -1527,10 +1532,14 @@ fn transparent_arrows_follow_pane_hover_and_keyboard_focus_without_layout_shift(
             "keyboard focus reveals the overlay"
         );
         window.press("enter", cx);
-        assert_eq!(view.read(cx).choices[id], Choice::Source);
+        assert!(
+            view.read(cx).choices.is_empty(),
+            "keyboard arrow does not choose"
+        );
         assert_eq!(view.read(cx).review_diffs[id].active, 1);
-        window.press("enter", cx);
+        window.press("space", cx);
         assert_eq!(view.read(cx).review_diffs[id].active, 0);
+        assert!(view.read(cx).choices.is_empty());
         assert_eq!(window.find("review-source-edge").disabled(), Some(true));
         assert!(received.try_recv().is_err());
     })
@@ -1610,7 +1619,7 @@ fn review_navigation_crosses_items_only_after_final_hunk(cx: &mut TestAppContext
 }
 
 #[gpui_kit::test]
-fn review_edges_choose_each_item_before_crossing_its_boundary(cx: &mut TestAppContext) {
+fn review_arrows_preserve_independent_choices_across_files(cx: &mut TestAppContext) {
     let (handle, view, received) = window(cx, true);
     let first = "target:files:first.txt";
     let second = "target:files:second.txt";
@@ -1628,30 +1637,26 @@ fn review_edges_choose_each_item_before_crossing_its_boundary(cx: &mut TestAppCo
             cx,
         );
         click_review_edge(window, false, cx);
-        assert_eq!(view.read(cx).choices[first], Choice::Target);
-        assert_eq!(view.read(cx).active_review_change().unwrap().id, first);
-        click_review_edge(window, false, cx);
         assert_eq!(view.read(cx).active_review_change().unwrap().id, second);
-        assert!(!view.read(cx).choices.contains_key(second));
         assert!(
-            window.find("review-target-edge").visible(),
-            "hover overlay remains discoverable across the transition"
+            view.read(cx).choices.is_empty(),
+            "implicit and undecided choices remain unchanged"
         );
-        click_review_edge(window, false, cx);
-        assert_eq!(view.read(cx).choices[second], Choice::Target);
+        assert_eq!(view.read(cx).unresolved(), 1);
         assert_eq!(window.find("review-target-edge").disabled(), Some(true));
-        click_review_edge(window, true, cx);
-        assert_eq!(view.read(cx).choices[second], Choice::Source);
-        assert_eq!(view.read(cx).active_review_change().unwrap().id, second);
+        assert!(window.find("review-target-edge").visible());
         click_review_edge(window, true, cx);
         assert_eq!(view.read(cx).active_review_change().unwrap().id, first);
-        assert_eq!(
-            view.read(cx).choices[first],
-            Choice::Target,
-            "navigation never copies the other item's choice"
-        );
-        click_review_edge(window, true, cx);
+        click_review_content(window, true, cx);
+        click_review_edge(window, false, cx);
+        assert_eq!(view.read(cx).active_review_change().unwrap().id, second);
         assert_eq!(view.read(cx).choices[first], Choice::Source);
+        assert!(!view.read(cx).choices.contains_key(second));
+        click_review_content(window, false, cx);
+        click_review_edge(window, true, cx);
+        assert_eq!(view.read(cx).active_review_change().unwrap().id, first);
+        assert_eq!(view.read(cx).choices[first], Choice::Source);
+        assert_eq!(view.read(cx).choices[second], Choice::Target);
         assert_eq!(window.find("review-source-edge").disabled(), Some(true));
         assert!(received.try_recv().is_err());
     })
@@ -1695,15 +1700,30 @@ fn boundary_navigation_uses_pending_order_and_stable_target_ids(cx: &mut TestApp
             second,
             "same path on a different target is a distinct item"
         );
-        window.press("alt-down", cx);
+        click_review_edge(window, false, cx);
         assert_eq!(
             view.read(cx).active_review_change().unwrap().id,
             last,
             "resolved and implicit decisions are skipped"
         );
-        window.press("alt-up", cx);
+        click_review_edge(window, true, cx);
         assert_eq!(view.read(cx).active_review_change().unwrap().id, second);
-        click_review_edge(window, false, cx);
+        assert_eq!(
+            view.read(cx).choices.len(),
+            1,
+            "Pending navigation does not resolve anything"
+        );
+        assert!(
+            !window
+                .find_all("review-item-target:files:same.txt")
+                .is_empty()
+        );
+        assert!(
+            !window
+                .find_all("review-item-other:files:same.txt")
+                .is_empty()
+        );
+        click_review_content(window, false, cx);
         assert_eq!(view.read(cx).choices[second], Choice::Target);
         assert_eq!(
             view.read(cx).active_review_change().unwrap().id,
@@ -1712,7 +1732,7 @@ fn boundary_navigation_uses_pending_order_and_stable_target_ids(cx: &mut TestApp
         );
         view.update(cx, |view, cx| {
             view.navigate_review(second, true, cx);
-            view.activate_review_edge(second, Choice::Source, cx);
+            view.navigate_review(second, false, cx);
         });
         assert_eq!(
             view.read(cx).choices[second],
@@ -1720,10 +1740,10 @@ fn boundary_navigation_uses_pending_order_and_stable_target_ids(cx: &mut TestApp
             "a stale item callback cannot change the removed item"
         );
         assert!(!view.read(cx).choices.contains_key(first));
-        click_review_edge(window, false, cx);
+        click_review_content(window, false, cx);
         assert_eq!(view.read(cx).active_review_change().unwrap().id, last);
         assert!(!view.read(cx).choices.contains_key(last));
-        click_review_edge(window, false, cx);
+        click_review_content(window, false, cx);
         assert!(view.read(cx).active_review_change().is_none());
         window.press("alt-down", cx);
         window.press("alt-up", cx);
@@ -1781,11 +1801,21 @@ fn boundary_navigation_traverses_safe_previews_without_choices_or_writes(cx: &mu
                 "safe previews still expose navigation"
             );
             if *id == ids[3] {
-                assert_eq!(window.find("review-source-edge").disabled(), Some(true));
+                assert_ne!(
+                    window.find("review-source-edge").disabled(),
+                    Some(true),
+                    "unavailable source does not block previous navigation"
+                );
+                assert_eq!(
+                    window
+                        .find("choose-source-target:files:unavailable.txt")
+                        .disabled(),
+                    Some(true)
+                );
             }
         }
         for id in ids[..4].iter().rev() {
-            window.press("alt-up", cx);
+            click_review_edge(window, true, cx);
             assert_eq!(&view.read(cx).active_review_change().unwrap().id, id);
         }
         assert!(view.read(cx).choices.is_empty());
@@ -1927,6 +1957,73 @@ fn changing_review_item_during_a_press_cannot_choose_the_destination(cx: &mut Te
                 "old press must not choose new content ({control})"
             );
         }
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn arrow_hover_has_no_version_choice_cue_and_content_hover_recovers(cx: &mut TestAppContext) {
+    let painted = |window: &gpui_kit::Window, expected: &str| {
+        gpui_kit::base::test_support::texts(window)
+            .iter()
+            .any(|text| text.text() == expected && text.visible())
+    };
+    let (handle, view, received) = window(cx, true);
+    let id = "target:files:hover.txt";
+    let (source, target) = separated_hunks();
+    cx.update_window(handle, |_, window, cx| {
+        review_snapshot(
+            &view,
+            vec![review_change(id, "hover.txt", true)],
+            vec![(id, &target, &source)],
+            window,
+            cx,
+        );
+        window.click("next-diff-hunk", cx);
+        click_review_content(window, true, cx);
+        assert_eq!(view.read(cx).choices[id], Choice::Source);
+        let body = window.find("review-code-surface").bounds();
+        let target_point = gpui_kit::point(
+            body.left() + body.size.width * 0.75,
+            body.bottom() - px(20.),
+        );
+        hover_point(window, target_point, cx);
+        assert!(painted(window, "○ Keep on Target"));
+        window.hover("review-target-edge", cx);
+        assert_eq!(view.read(cx).review_hover_owner, Some("target-edge"));
+        assert!(window.find("review-target-edge").visible());
+        assert!(
+            !painted(window, "○ Keep on Target"),
+            "arrow hover must not advertise a target choice"
+        );
+        assert!(painted(window, "✓ Selected"));
+        window.click("review-target-edge", cx);
+        assert_eq!(view.read(cx).choices[id], Choice::Source);
+        assert_eq!(view.read(cx).review_diffs[id].active, 2);
+        assert!(!painted(window, "○ Keep on Target"));
+        hover_point(window, target_point, cx);
+        assert!(
+            painted(window, "○ Keep on Target"),
+            "ordinary content regains its choice cue"
+        );
+        click_review_content(window, false, cx);
+        hover_point(
+            window,
+            gpui_kit::point(
+                body.left() + body.size.width * 0.25,
+                body.bottom() - px(20.),
+            ),
+            cx,
+        );
+        assert!(painted(window, "○ Use on Target →"));
+        window.hover("review-source-edge", cx);
+        assert_eq!(view.read(cx).review_hover_owner, Some("source-edge"));
+        assert!(!painted(window, "○ Use on Target →"));
+        assert!(painted(window, "✓ Selected"));
+        window.click("review-source-edge", cx);
+        assert_eq!(view.read(cx).choices[id], Choice::Target);
+        assert_eq!(view.read(cx).review_diffs[id].active, 1);
         assert!(received.try_recv().is_err());
     })
     .unwrap();

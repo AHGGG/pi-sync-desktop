@@ -182,6 +182,30 @@ fn main() -> anyhow::Result<()> {
                 window.render_frame(cx);
             } else {
                 let body = window.find("review-code-surface").bounds();
+                let source_position = gpui_kit::point(
+                    body.left() + body.size.width * 0.25,
+                    body.bottom() - px(70.),
+                );
+                window.dispatch_event(
+                    gpui_kit::PlatformInput::MouseDown(gpui_kit::MouseDownEvent {
+                        position: source_position,
+                        button: gpui_kit::MouseButton::Left,
+                        click_count: 1,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                window.render_frame(cx);
+                window.dispatch_event(
+                    gpui_kit::PlatformInput::MouseUp(gpui_kit::MouseUpEvent {
+                        position: source_position,
+                        button: gpui_kit::MouseButton::Left,
+                        click_count: 1,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                window.render_frame(cx);
                 window.dispatch_event(
                     gpui_kit::PlatformInput::MouseMove(gpui_kit::MouseMoveEvent {
                         position: gpui_kit::point(
@@ -194,7 +218,23 @@ fn main() -> anyhow::Result<()> {
                 );
                 window.render_frame(cx);
                 window.click("review-target-edge", cx);
-                window.click("review-target-edge", cx);
+                assert!(!window.find_all_by_label("Hunk 2 of 3").is_empty());
+                assert_eq!(
+                    window
+                        .find("choose-source-example:files:extensions/example.ts")
+                        .checked(),
+                    Some(true)
+                );
+                assert_ne!(
+                    window
+                        .find("choose-target-example:files:extensions/example.ts")
+                        .checked(),
+                    Some(true)
+                );
+                assert!(!gpui_kit::base::test_support::texts(window).iter().any(
+                    |text| text.text() == "○ Keep on Example workstation (fixture)"
+                        && text.visible()
+                ));
                 if fixture_next_file {
                     window.click("review-target-edge", cx);
                     assert!(!window.find_all_by_label("Hunk 3 of 3").is_empty());

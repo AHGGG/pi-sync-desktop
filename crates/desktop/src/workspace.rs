@@ -1,7 +1,7 @@
 //! The workspace owns selection and presentation; backend owns durable profiles,
 //! device I/O, reviewed plans, conflict validation, and explicit application.
 use crate::ui_model::*;
-use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::base::{TestSupportExt as _, TestTextExt as _};
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, WindowExt,
     button::{Button, ButtonCustomVariant, ButtonVariants},
@@ -1023,22 +1023,6 @@ impl Workspace {
         cx.notify();
     }
 
-    fn activate_review_edge(&mut self, id: &str, side: Choice, cx: &mut Context<Self>) {
-        // An implicit default is not a first click. The edge always chooses
-        // before it navigates. A destination item needs its own explicit choice.
-        if self
-            .active_review_change()
-            .is_none_or(|change| change.id != id)
-        {
-            return;
-        }
-        if self.choices.get(id) == Some(&side) {
-            self.navigate_review(id, side == Choice::Target, cx);
-        } else {
-            self.choose_review_side(id, side, cx);
-        }
-    }
-
     fn review_keyboard(
         &mut self,
         side: Option<Choice>,
@@ -1263,15 +1247,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let source = side == Choice::Source;
-        let selected = self.choices.get(&change.id) == Some(&side);
         let can_move = self.review_destination(&change.id, !source).is_some();
-        let label = if selected {
-            self.review_navigation_label(&change.id, !source)
-        } else if source {
-            "Choose source version first".into()
-        } else {
-            "Choose target version first".into()
-        };
+        let label = self.review_navigation_label(&change.id, !source);
         let id = change.id.clone();
         let hovered = self.review_hovered_side == Some(side);
         let hover_owner = if source { "source-edge" } else { "target-edge" };
@@ -1291,6 +1268,12 @@ impl Workspace {
             .when(!source, |el| el.right(px(16.)))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 this.hover_review_side(hover_owner, (*hovered).then_some(side), cx);
+            }))
+            .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                // The translucent overlay sits above the content hitbox. Keep
+                // its navigation hover from becoming a pane-selection cue.
+                this.hover_review_side(hover_owner, Some(side), cx);
+                cx.stop_propagation();
             }))
             .child(
                 Button::new(if source {
@@ -1322,12 +1305,11 @@ impl Workspace {
                 )
                 .accessibility_label(label.clone())
                 .tooltip(label)
-                .disabled(
-                    self.busy.is_some()
-                        || (source && !change.source_available)
-                        || (selected && !can_move),
-                )
+                .disabled(self.busy.is_some() || !can_move)
                 .on_click(cx.listener(move |this, event, _, cx| {
+                    // Navigation is independent of version selection. Never let
+                    // an arrow click become a choice on the content beneath it.
+                    cx.stop_propagation();
                     // Edge double-clicks are intentional; dragging the edge is not.
                     if let ClickEvent::Mouse(mouse) = event {
                         let delta = mouse.up.position - mouse.down.position;
@@ -1339,7 +1321,7 @@ impl Workspace {
                             return;
                         }
                     }
-                    this.activate_review_edge(&id, side, cx);
+                    this.navigate_review(&id, !source, cx);
                 })),
             )
     }
@@ -1356,7 +1338,9 @@ impl Workspace {
         let selected = self.review_choice(change) == Some(side);
         let source = side == Choice::Source;
         let disabled = self.busy.is_some() || (source && !change.source_available);
-        let hovered = self.review_hovered_side == Some(side) && !disabled;
+        let hovered = self.review_hovered_side == Some(side)
+            && !disabled
+            && !matches!(self.review_hover_owner, Some("source-edge" | "target-edge"));
         let role = if source { "Source" } else { "Target" };
         let action = if source {
             format!("Use on {destination_name} →")
@@ -1472,7 +1456,7 @@ impl Workspace {
                         } else {
                             cx.theme().muted_foreground
                         })
-                        .child(cue),
+                        .child(cue.clone().test_text(cue)),
                 ),
         )
         .selected(selected)

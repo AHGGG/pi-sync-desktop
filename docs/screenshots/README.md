@@ -21,7 +21,7 @@ For Linux with Chromium's existing Swiftshader ICD, set
 `VK_ICD_FILENAMES=/usr/lib/chromium/vk_swiftshader_icd.json` and, when appropriate,
 `RUST_FONTCONFIG_DLOPEN=1`. Normal platform linker dependencies still apply.
 The tool drains SVG asset tasks, renders again, and rejects blank captures.
-`--fixture-navigation` selects the synthetic target version through its outer edge, then activates that edge again to highlight hunk 2 of 3. It does not connect to a device or apply files.
+`--fixture-navigation` selects the synthetic source version by clicking its content, then clicks the right overlay to highlight hunk 2 of 3 while preserving the source choice. It also verifies the arrow hover does not advertise keeping the target version. It does not connect to a device or apply files.
 
 Headless interaction tests separately exercise production controls, onboarding,
 remembered selection, cancellation, keyboard review, authentication, and single-shot

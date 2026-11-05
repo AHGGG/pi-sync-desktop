@@ -1,5 +1,11 @@
 # Verification record
 
+## Independent version choices and navigation · 2026-11-05
+
+- `cargo test --locked --workspace`: 63 desktop tests, 25 core tests and the fixture diagnostic passed locally. Updated real-pointer regressions cover Source → right arrow and Target → left arrow without changing choices, undecided/default choices across file boundaries, unresolved Pending items, unavailable-source backward navigation, disabled boundaries, and Enter/Space navigation. A new hover regression verifies content → arrow → content cues without advertising a choice over an arrow. Existing selection/scroll and held-pointer guards remain covered.
+- All 143 backend tests, workspace/all-targets/all-features Clippy with warnings denied, formatting and the public-source scan passed. Native GPUI/WGPU navigation and next-file captures were inspected. The navigation fixture now selects Source through the pane, then activates the opposite arrow and asserts Source stays selected. No live connection or sync was performed.
+- Opt-in helper-process and real-SSH checks are not part of this local UI run; the exact published commit is checked separately in the native CI matrix. Earlier records below describe the superseded select-first implementation.
+
 ## Hunk-to-item boundary navigation · 2026-11-05
 
 - `cargo test --locked --workspace`: 62 desktop tests, 25 core tests and the fixture-diagnostic test passed locally on Linux. Six new production-view tests cover boundary-only item transitions, first/last entry for revisited items, select-first overlays on each item, Pending and duplicate paths across targets, opaque/equal/unavailable previews, busy/dialog/no-plan guards, visible offscreen reverse entry, and navigation during a held content/overlay/top-button press. No navigation test emits a backend command.
