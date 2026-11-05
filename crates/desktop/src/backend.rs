@@ -1297,6 +1297,12 @@ fn expand_local_root(root: &str, home: &Path) -> Result<PathBuf> {
         !root.is_empty() && !root.contains('\0'),
         "Invalid Pi directory"
     );
+    // Windows joins onto a verbatim home path normalize `..`. Validate the
+    // original spelling first, before any operation can erase traversal.
+    ensure!(
+        !root.split(std::path::is_separator).any(|part| part == ".."),
+        "Parent traversal is not allowed in the Pi directory"
+    );
     let root = if root == "~" {
         home.to_path_buf()
     } else if root.starts_with("~/") || root.starts_with("~\\") {
@@ -1698,6 +1704,21 @@ mod tests {
         tempfile::tempdir_in(base).unwrap()
     }
 
+    fn raw_traversal_path(root: &Path, suffix: &str) -> PathBuf {
+        // PathBuf::join normalizes parent components on Windows verbatim
+        // prefixes. Append raw OS text so the fixture actually contains `..`.
+        let mut raw = root.as_os_str().to_os_string();
+        raw.push(std::path::MAIN_SEPARATOR.to_string());
+        raw.push(suffix.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let path = PathBuf::from(raw);
+        assert!(
+            path.components()
+                .any(|part| matches!(part, std::path::Component::ParentDir)),
+            "traversal fixture was normalized: {path:?}"
+        );
+        path
+    }
+
     #[test]
     fn native_paths_map_multiple_files_folders_and_builtins_without_duplicates() {
         let dir = picker_tempdir();
@@ -1755,7 +1776,7 @@ mod tests {
         for path in [
             dir.path().join("outside.txt"),
             root.clone(),
-            root.join("../agent/okay.txt"),
+            raw_traversal_path(&root, "../agent/okay.txt"),
             root.join("auth.json"),
             root.join("secret.txt"),
             root.join(".hidden"),
@@ -2018,7 +2039,14 @@ mod tests {
             selected_local_items(&root.join("."), &[root.join("example.txt")], vec![]).unwrap(),
             vec!["path:example.txt"]
         );
-        assert!(selected_local_items(&root, &[root.join("../agent/example.txt")], vec![]).is_err());
+        assert!(
+            selected_local_items(
+                &root,
+                &[raw_traversal_path(&root, "../agent/example.txt")],
+                vec![]
+            )
+            .is_err()
+        );
     }
 
     #[cfg(any(windows, target_os = "macos"))]
@@ -2051,6 +2079,36 @@ mod tests {
         );
         assert!(expand_local_root("relative", home.path()).is_err());
         assert!(expand_local_root("~/../escape", home.path()).is_err());
+        assert!(expand_local_root("~/.pi/../escape", home.path()).is_err());
+        #[cfg(windows)]
+        for spelling in [
+            "~\\..\\escape",
+            "~\\.pi\\..\\escape",
+            "~/nested\\..\\escape",
+        ] {
+            assert!(
+                expand_local_root(spelling, home.path()).is_err(),
+                "accepted {spelling}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_root_rejects_traversal_before_verbatim_home_join_normalizes_it() {
+        let home = Path::new(r"\\?\C:\Users\test");
+        for spelling in ["~/../escape", r"~\..\escape", r"~/nested\..\escape"] {
+            assert!(
+                expand_local_root(spelling, home).is_err(),
+                "accepted {spelling}"
+            );
+        }
+        assert_eq!(
+            expand_local_root("~/safe", home).unwrap(),
+            home.join("safe")
+        );
+        let raw = raw_traversal_path(home, "../escape");
+        assert!(expand_local_root(raw.to_str().unwrap(), home).is_err());
     }
 
     #[test]

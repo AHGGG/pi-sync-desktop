@@ -970,6 +970,20 @@ fn review_change(id: &str, path: &str, available: bool) -> Change {
     }
 }
 
+// A tall hunk with stable anchors is cheap to diff within the production 20 ms
+// budget. At most four equal rows between edits keep it one hunk at radius 3.
+fn tall_review_hunk(side: &str) -> String {
+    (0..90)
+        .map(|i| {
+            if i < 2 || i % 5 == 0 {
+                format!("{side} {i}\n")
+            } else {
+                format!("line {i}\n")
+            }
+        })
+        .collect()
+}
+
 fn click_point(
     window: &mut gpui_kit::Window,
     position: gpui_kit::Point<gpui_kit::Pixels>,
@@ -1733,18 +1747,8 @@ fn navigation_reveals_offscreen_hunks_and_preserves_copy_selection(cx: &mut Test
     let context = (0..10)
         .map(|ix| format!("context {ix}\n"))
         .collect::<String>();
-    let source = format!(
-        "{}{context}final source hunk\n",
-        (0..90)
-            .map(|ix| format!("source {ix}\n"))
-            .collect::<String>()
-    );
-    let target = format!(
-        "{}{context}final target hunk\n",
-        (0..90)
-            .map(|ix| format!("target {ix}\n"))
-            .collect::<String>()
-    );
+    let source = format!("{}{context}final source hunk\n", tall_review_hunk("source"));
+    let target = format!("{}{context}final target hunk\n", tall_review_hunk("target"));
     cx.update_window(handle, |_, window, cx| {
         review_snapshot(
             &view,
@@ -1757,6 +1761,7 @@ fn navigation_reveals_offscreen_hunks_and_preserves_copy_selection(cx: &mut Test
     .unwrap();
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
+        assert_eq!(view.read(cx).review_diffs[id].hunks.len(), 2);
         window.render_frame(cx);
         assert!(window.find_all_by_label("final source hunk").is_empty());
         let state = view.read(cx).review_diffs[id].state.clone();
@@ -2205,11 +2210,11 @@ fn entering_previous_item_reveals_its_last_hunk(cx: &mut TestAppContext) {
         .collect::<String>();
     let source = format!(
         "{}{unchanged}last source hunk\n",
-        (0..90).map(|i| format!("source {i}\n")).collect::<String>()
+        tall_review_hunk("source")
     );
     let target = format!(
         "{}{unchanged}last target hunk\n",
-        (0..90).map(|i| format!("target {i}\n")).collect::<String>()
+        tall_review_hunk("target")
     );
     cx.update_window(handle, |_, window, cx| {
         review_snapshot(
@@ -2226,6 +2231,7 @@ fn entering_previous_item_reveals_its_last_hunk(cx: &mut TestAppContext) {
     .unwrap();
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| {
+        assert_eq!(view.read(cx).review_diffs[first].hunks.len(), 2);
         window.render_frame(cx);
         window.click("review-item-target:files:short.txt", cx);
         window.click("previous-diff-hunk", cx);
