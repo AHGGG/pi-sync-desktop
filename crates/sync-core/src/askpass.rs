@@ -71,6 +71,9 @@ impl Askpass {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
             Err(error) => return Err(error.into()),
         };
+        // BSD/macOS can inherit O_NONBLOCK from the listening socket. Explicitly
+        // restore blocking reads before applying the absolute request deadline.
+        stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         let mut supplied = Zeroizing::new([0u8; 32]);
@@ -385,6 +388,32 @@ mod tests {
         );
         assert!(parse_prompt("bad user@resolved.example's password:", &alias).is_none());
         assert!(parse_prompt("actual@bad\nhost's password:", &alias).is_none());
+    }
+    #[test]
+    fn fragmented_authenticated_request_waits_within_deadline() {
+        let mut bridge = bridge();
+        let mut stream = TcpStream::connect(bridge.listener.local_addr().unwrap()).unwrap();
+        let capability = bridge.capability.clone();
+        stream.write_all(&capability[..16]).unwrap();
+        let client = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            stream.write_all(&capability[16..]).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            write_frame(&mut stream, b"pi@example.com's password:").unwrap();
+            let mut status = [0];
+            stream.read_exact(&mut status).unwrap();
+            assert_eq!(status, [1]);
+            assert_eq!(
+                &**read_frame(&mut stream, MAX_SECRET).unwrap(),
+                b"fixture answer"
+            );
+        });
+        assert!(
+            !bridge
+                .poll(&mut |_| AuthAnswer::Secret(Zeroizing::new("fixture answer".into())))
+                .unwrap()
+        );
+        client.join().unwrap();
     }
     #[test]
     fn rejects_wrong_answer_types_and_multiline_secrets() {

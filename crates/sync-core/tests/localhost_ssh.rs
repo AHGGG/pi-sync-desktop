@@ -10,6 +10,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
+    io::{Read, Seek, SeekFrom},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -47,11 +48,30 @@ fn fixture_connect(
     SshTransport::connect_with_options(config, known, prompt, &fixture_options(known)?)
 }
 
-struct Server(Child);
+// Logs belong only to the disposable loopback server, never the product SSH
+// client. INFO logs contain authentication decisions, not private key material.
+// Rust captures this output and displays it on a failed test, including `?`
+// returns (not only panics). Keep the reported tail bounded.
+struct Server(Child, Option<PathBuf>);
+fn fixture_log_tail(path: &Path) -> std::io::Result<String> {
+    const MAX_LOG_BYTES: u64 = 16 * 1024;
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(MAX_LOG_BYTES)))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_LOG_BYTES).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+        if let Some(path) = &self.1 {
+            match fixture_log_tail(path) {
+                Ok(log) => eprintln!("Isolated sshd diagnostics (last 16 KiB):\n{log}"),
+                Err(error) => eprintln!("Cannot read isolated sshd diagnostics: {error}"),
+            }
+        }
     }
 }
 fn generate_key(path: &Path) -> Result<()> {
@@ -97,14 +117,16 @@ fn start_server(dir: &Path, host: &Path, port: u16, node_dir: &Path) -> Result<S
         "Unprivileged SSH fixture configuration rejected: {}",
         String::from_utf8_lossy(&check.stderr)
     );
+    let log_path = dir.join("sshd.log");
+    let log = fs::File::create(&log_path)?;
     let child = Command::new(sshd)
         .args(["-D", "-e", "-f"])
         .arg(config)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(log))
         .spawn()?;
-    let mut server = Server(child);
+    let mut server = Server(child, Some(log_path));
     let start = Instant::now();
     loop {
         if let Some(status) = server.0.try_wait()? {
@@ -360,6 +382,7 @@ fn key_auth_trust_worker_apply_and_changed_host_refusal() -> Result<()> {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()?,
+            None,
         );
         let started = Instant::now();
         while !agent_socket.exists() {
@@ -599,5 +622,20 @@ export async function handle(request) {
         );
         assert_eq!(fs::read_to_string(&marker)?, "once\n");
     }
+    Ok(())
+}
+
+#[test]
+fn fixture_diagnostics_are_bounded_to_the_tail() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("sshd.log");
+    let mut contents = vec![b'a'; 32 * 1024];
+    contents.extend_from_slice(b"fixture rejection reason\n");
+    fs::write(&path, &contents)?;
+    let tail = fixture_log_tail(&path)?;
+    assert_eq!(tail.len(), 16 * 1024);
+    assert!(tail.ends_with("fixture rejection reason\n"));
+    fs::write(&path, b"short log")?;
+    assert_eq!(fixture_log_tail(&path)?, "short log");
     Ok(())
 }

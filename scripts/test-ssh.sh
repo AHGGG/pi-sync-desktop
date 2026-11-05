@@ -20,4 +20,12 @@ cargo build --locked -p sync-core --example askpass_fixture
 # Respect Cargo's configured target directory without assuming a user shell setup.
 target_dir=$(cargo metadata --format-version 1 --no-deps | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).target_directory')
 export PI_SYNC_TEST_ASKPASS="$target_dir/debug/examples/askpass_fixture"
-cargo test --locked -p sync-core --test localhost_ssh -- --ignored --test-threads=1
+# StrictModes checks authorized_keys ancestors too: the runner's normal /tmp
+# is world-writable. RUNNER_TEMP is outside the checkout (required by worker
+# Git-ancestor guards), with runner-owned non-writable-by-others ancestors.
+# Scope this override to the disposable fixture; do not modify system settings.
+if [[ -n "${RUNNER_TEMP:-}" ]]; then
+  TMPDIR="$RUNNER_TEMP" cargo test --locked -p sync-core --test localhost_ssh -- --ignored --test-threads=1
+else
+  cargo test --locked -p sync-core --test localhost_ssh -- --ignored --test-threads=1
+fi

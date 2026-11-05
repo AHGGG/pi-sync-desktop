@@ -2,11 +2,13 @@
 
 ## System OpenSSH migration · 2026-11-05
 
-- `cargo test --locked --workspace`: 24 core and 43 desktop tests passed in the Linux development environment. Coverage includes alias/profile migration, native prompt validation, custom-trust preflight rejection, cancelled-dialog cleanup, and consumed apply approvals.
+- `cargo test --locked --workspace`: 25 core and 43 desktop tests passed in the Linux development environment. Coverage includes alias/profile migration, native prompt validation, custom-trust preflight rejection, cancelled-dialog cleanup, and consumed apply approvals.
 - `node --test backend/tests/*.test.mjs`: 143 tests passed, including transport lifetime while native authentication is pending.
 - `node scripts/test-askpass.mjs`: actual helper-process integration passed locally for password/passphrase, explicit host trust, cancellation, unknown prompts and parent-bridge cleanup.
 - `PI_SYNC_TEST_SKIP_AGENT=1 scripts/test-ssh.sh`: isolated localhost OpenSSH integration passed with agent coverage explicitly skipped. The container denied AF_UNIX socket creation for the disposable `ssh-agent`; this is not a full integration pass. The dedicated synthetic-agent test is implemented and required by default.
 - Formatting, warnings-denied workspace/all-targets Clippy, the public-source scan and Linux release build passed. A fresh production GPUI/WGPU onboarding render was visually inspected, including alias guidance and the selected-client label.
+- The first migration CI run exposed a macOS accepted-socket blocking-mode difference; accepted askpass sockets now explicitly use blocking mode with the existing absolute deadline, covered by a fragmented-request regression.
+- The Linux CI fixture now places its disposable keys under the runner’s private temp directory. A synthetic world-writable temp-parent reproduction confirmed the original failure was sshd StrictModes correctly rejecting that ancestor; server authentication policy was not relaxed.
 - The native CI matrix must pass for the exact pushed commit. It includes real helper-process tests on Linux, macOS and Windows, plus the mandatory isolated SSH-agent fixture on Linux. A matrix definition is not evidence that those jobs passed.
 
 The transport now uses system OpenSSH and a persistent Node worker. The Linux fixture is synthetic and localhost-only; it does not establish Windows/macOS execution, actual Bitwarden integration, password-server/MFA support, or connectivity to the user's devices. Keyboard-interactive/MFA is disabled by design. No user SSH credentials, server crypto settings or real Pi configuration were changed by this fixture. Earlier entries below describe their historical implementations and are not evidence for unrun migration checks.
