@@ -18,15 +18,16 @@ const missing = (e) => e.code === 'ENOENT';
 // Custom selections deliberately cannot bypass audited configuration or permission boundaries.
 const MAX_CUSTOM_FILES = 256;
 const MAX_CUSTOM_BYTES = 8 * 1024 * 1024;
-export function validateRelativePath(value) {
+export function validateRelativePath(value, allowProtected = false) {
   if (typeof value !== 'string' || !value || value.length > 1024 || /[\\\x00-\x1f\x7f:?*<>|\"]/.test(value) || value.startsWith('/') || value.split('/').some(p => !p || p === '.' || p === '..')) fail('INVALID_CUSTOM_PATH');
   const parts = value.split('/');
   for (const part of parts) {
-    const p = part.toLowerCase();
+    const p = part.normalize('NFKC').toLowerCase();
+    if (/[\\/\x00-\x1f\x7f:?*<>|\"]/.test(p) || p === '.' || p === '..') fail('INVALID_CUSTOM_PATH');
     if (['__proto__', 'prototype', 'constructor'].includes(p) || /[. ]$/.test(p) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/.test(p)) fail('INVALID_CUSTOM_PATH');
-    if (p.startsWith('.') || /credential|password|secret|(?:^|[._-])(?:oauth|authentication|authorization)(?:[._-]|$)/i.test(p) || /^(auth|credentials?|secrets?|tokens?|passwords?)([._-]|$)/i.test(p) || /(?:^|[._-])(credentials?|secrets?|tokens?)(?:[._-]|$)/i.test(p) || /^(id_rsa|id_ed25519|id_ecdsa|known_hosts|authorized_keys)$/.test(p) || /\.(pem|key|p12|pfx|env)$/i.test(p)) fail('PROTECTED_CUSTOM_PATH');
+    if (!allowProtected && (p.startsWith('.') || /credential|password|secret|(?:^|[._-])(?:oauth|authentication|authorization)(?:[._-]|$)/i.test(p) || /^(auth|credentials?|secrets?|tokens?|passwords?)([._-]|$)/i.test(p) || /(?:^|[._-])(credentials?|secrets?|tokens?)(?:[._-]|$)/i.test(p) || /^(id_rsa|id_ed25519|id_ecdsa|known_hosts|authorized_keys)$/.test(p) || /\.(pem|key|p12|pfx|env)$/i.test(p))) fail('PROTECTED_CUSTOM_PATH');
   }
-  if (['settings.json', 'mcp.json', 'subagents.json', 'models.json'].includes(parts[0].toLowerCase())) fail('AUDITED_DOCUMENT_REQUIRED');
+  if (!allowProtected && ['settings.json', 'mcp.json', 'subagents.json', 'models.json'].includes(parts[0].normalize('NFKC').toLowerCase())) fail('AUDITED_DOCUMENT_REQUIRED');
   return value;
 }
 // Reject names that alias on case-insensitive or normalization-insensitive filesystems.
@@ -52,16 +53,57 @@ function checkedPaths(paths) {
   validatePathCollisions(selected);
   return selected;
 }
+export const CONTENT_LIMITS = Object.freeze({ fileBytes: MAX_BYTES, totalBytes: MAX_CUSTOM_BYTES, files: MAX_CUSTOM_FILES, entries: 4096, depth: 32 });
+// Raw code-unit order is total and independent of locale/ICU collation.
+const pathOrder = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+const portable = rel => rel.normalize('NFKC').toLowerCase();
+export function validateContentRules(rules = {}) {
+  if (!object(rules) || Object.keys(rules).length > CONTENT_LIMITS.entries) fail('INVALID_CONTENT_RULES');
+  const seen = new Set();
+  for (const [rel, included] of Object.entries(rules)) {
+    if (typeof included !== 'boolean') fail('INVALID_CONTENT_RULES');
+    validateRelativePath(rel, !included);
+    const key = portable(rel);
+    if (seen.has(key)) fail('INVALID_CONTENT_RULES');
+    seen.add(key);
+  }
+  return rules;
+}
+function contentSelection(rules) {
+  const entries = Object.entries(validateContentRules(rules)).map(([rel, include]) => [portable(rel), include]);
+  const included = rel => {
+    const key = portable(rel);
+    let result = true, length = -1;
+    for (const [prefix, include] of entries) if ((key === prefix || key.startsWith(prefix + '/')) && prefix.length > length) {
+      result = include; length = prefix.length;
+    }
+    return result;
+  };
+  return { included, traverse: rel => included(rel) || entries.some(([key, include]) => include && key.startsWith(portable(rel) + '/')) };
+}
+const limitFail = (rel, size, kind) => {
+  const error = new Error(kind === 'fileBytes' ? 'FILE_TOO_LARGE' : 'CUSTOM_SELECTION_TOO_LARGE');
+  error.workerCode = error.message;
+  error.detail = { path: rel, size, limit: CONTENT_LIMITS[kind], kind };
+  throw error;
+};
+// Iterate directory entries without allocating an unbounded directory listing.
+async function children(file, visit) {
+  const handle = await fs.opendir(file);
+  for await (const entry of handle) await visit(entry.name);
+}
 const CUSTOM_DIRECTORIES = Symbol("customDirectories");
-async function customSnapshot(dir, selections, required = false) {
-  const records = Object.create(null);
-  const observedPaths = new Set();
-  const directories = [];
+async function customSnapshot(dir, selections, required = false, rules = {}) {
+  const selection = contentSelection(rules);
+  const records = Object.create(null), observedPaths = new Set(), directories = [];
   records[CUSTOM_DIRECTORIES] = directories;
-  let count = 0, total = 0, visited = 0;
+  let count = 0, total = 0, visited = 0, scanned = 0;
   async function visit(rel, depth = 0) {
-    if (++visited > 1024 || depth > 32) fail('CUSTOM_SELECTION_TOO_LARGE');
+    // Excluded branches are never inspected, validated for protection, read or hashed.
+    if (!selection.traverse(rel)) return;
+    if (++visited > CONTENT_LIMITS.entries || depth > CONTENT_LIMITS.depth) fail('CUSTOM_SELECTION_TOO_LARGE');
     validateRelativePath(rel);
+    if (observedPaths.has(rel)) return;
     observedPaths.add(rel);
     validatePathCollisions([...observedPaths]);
     const file = path.join(dir, rel);
@@ -73,19 +115,65 @@ async function customSnapshot(dir, selections, required = false) {
     if (info.isDirectory()) {
       directories.push(rel);
       await rejectRepositoryAncestors(file);
-      for (const entry of (await fs.readdir(file)).sort()) await visit(rel + '/' + entry, depth + 1);
+      await children(file, async entry => {
+        if (++scanned > CONTENT_LIMITS.entries) fail('CUSTOM_SELECTION_TOO_LARGE');
+        await visit(rel + '/' + entry, depth + 1);
+      });
       return;
     }
-    if (own(records, rel)) return;
-    const record = await read(file, true);
+    if (!selection.included(rel)) return;
+    if (info.size > MAX_BYTES) limitFail(rel, info.size, 'fileBytes');
+    if (count + 1 > MAX_CUSTOM_FILES) limitFail(rel, count + 1, 'files');
+    if (total + info.size > MAX_CUSTOM_BYTES) limitFail(rel, total + info.size, 'totalBytes');
+    const record = await read(file, true, rel);
     if (!record.exists) fail('CUSTOM_PATH_CHANGED');
-    if (++count > MAX_CUSTOM_FILES || (total += record.bytes.length) > MAX_CUSTOM_BYTES) fail('CUSTOM_SELECTION_TOO_LARGE');
+    if ((total += record.bytes.length) > MAX_CUSTOM_BYTES) limitFail(rel, total, 'totalBytes');
+    count++;
     records[rel] = record;
   }
   for (const rel of checkedPaths(selections)) await visit(rel);
   return records;
 }
-const customPublic = records => Object.fromEntries(Object.entries(records).map(([rel, r]) => [rel, { hash: r.hash, base64: r.bytes.toString('base64') }]));
+async function contents(dir, selections, rules = {}) {
+  const selection = contentSelection(rules);
+  const entries = [], seen = new Set();
+  async function visit(rel, depth = 0) {
+    if (seen.has(rel)) return;
+    if (entries.length >= CONTENT_LIMITS.entries || depth > CONTENT_LIMITS.depth) fail('CONTENT_INVENTORY_TOO_LARGE');
+    seen.add(rel);
+    const row = { path: rel, kind: 'blocked', size: null };
+    entries.push(row);
+    try {
+      validateRelativePath(rel);
+      const file = path.join(dir, rel);
+      await inspectPath(path.dirname(file), true);
+      await rejectRepositoryAncestors(path.dirname(file));
+      const info = await stat(file);
+      if (!info) { row.kind = 'missing'; return; }
+      if (info.isSymbolicLink()) fail('SYMLINK_REJECTED');
+      if (!info.isDirectory() && !info.isFile()) fail('NOT_REGULAR_FILE');
+      if (info.isDirectory()) await rejectRepositoryAncestors(file);
+      row.kind = info.isDirectory() ? 'directory' : 'file';
+      row.size = info.isFile() ? info.size : null;
+      const name = path.posix.basename(rel).toLowerCase();
+      if (/^(logs?|.*\.log)$/.test(name)) row.suggestedExclude = 'logs';
+      else if (/^(cache|caches|node_modules|__pycache__)$/.test(name)) row.suggestedExclude = 'cache';
+      if (info.isDirectory()) {
+        if (!selection.traverse(rel)) row.omitted = true;
+        else await children(file, name => visit(rel + '/' + name, depth + 1));
+      }
+    } catch (e) {
+      if (e.workerCode === 'CONTENT_INVENTORY_TOO_LARGE') throw e;
+      row.kind = 'blocked'; row.size = null;
+      row.blocked = e.workerCode ?? 'IO_ERROR';
+    }
+  }
+  let error;
+  try { for (const rel of checkedPaths(selections)) await visit(rel); }
+  catch (e) { error = e.workerCode ?? 'IO_ERROR'; }
+  return { ok: true, ...(error ? { error } : {}), entries: entries.sort((a, b) => pathOrder(a.path, b.path)), limits: CONTENT_LIMITS };
+}
+const customPublic = records => Object.fromEntries(Object.entries(records).sort(([a], [b]) => pathOrder(a, b)).map(([rel, r]) => [rel, { hash: r.hash, base64: r.bytes.toString('base64') }]));
 const backupName = key => key.startsWith('path:') ? `custom-${digest(key)}.bin` : `${key}.json`;
 
 async function stat(file) {
@@ -165,16 +253,16 @@ export function decodeModels(encoded) {
   return bytes;
 }
 
-async function read(file, raw = false) {
+async function read(file, raw = false, customRel) {
   await inspectPath(file);
   let handle;
   try {
     handle = await fs.open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     const s = await handle.stat();
     if (!s.isFile()) fail('NOT_REGULAR_FILE');
-    if (s.size > MAX_BYTES) fail('FILE_TOO_LARGE');
+    if (s.size > MAX_BYTES) { if (customRel) limitFail(customRel, s.size, 'fileBytes'); fail('FILE_TOO_LARGE'); }
     const bytes = await handle.readFile();
-    if (bytes.length > MAX_BYTES) fail('FILE_TOO_LARGE');
+    if (bytes.length > MAX_BYTES) { if (customRel) limitFail(customRel, bytes.length, 'fileBytes'); fail('FILE_TOO_LARGE'); }
     const value = raw ? undefined : parseObject(bytes);
     return { exists: true, hash: digest(bytes), value, bytes };
   } catch (e) {
@@ -221,8 +309,11 @@ export async function handle(request) {
   let lock;
   const temps = new Set();
   try {
-    if (!object(request) || !['snapshot', 'export-models', 'review-models', 'apply'].includes(request.op)) fail('INVALID_REQUEST');
+    if (!object(request) || !['contents', 'snapshot', 'export-models', 'review-models', 'apply'].includes(request.op)) fail('INVALID_REQUEST');
     const dir = await safeLocation(request);
+    if (request.op === 'contents') return await contents(dir, request.paths ?? [], request.contentRules);
+    const rules = validateContentRules(request.contentRules);
+    const selection = contentSelection(rules);
     const meta = path.join(dir, '.harness-sync');
     const files = { settings: path.join(dir, 'settings.json'), state: path.join(meta, 'shared-state.json'), models: path.join(dir, 'models.json'), mcp: path.join(dir, 'mcp.json'), subagents: path.join(dir, 'subagents.json') };
     if (request.op === 'review-models') {
@@ -261,7 +352,7 @@ export async function handle(request) {
       }
     })));
     const selections = checkedPaths(request.paths ?? []);
-    let custom = await customSnapshot(dir, selections, request.requirePaths === true);
+    let custom = await customSnapshot(dir, selections, request.requirePaths === true, rules);
     let previous = await readAll();
     if (request.op === 'snapshot') {
       const snapshot = { ok: true, ...(selections.length ? { customFiles: customPublic(custom), customDirectories: custom[CUSTOM_DIRECTORIES].sort() } : {}), ...Object.fromEntries(keys.map((k) => [k, publicRecord(!previous[k].exists && ['mcp', 'subagents'].includes(k) ? { ...previous[k], value: {} } : previous[k], k !== 'models')])) };
@@ -281,7 +372,7 @@ export async function handle(request) {
     const withinSelection = rel => selections.some(root => rel === root || rel.startsWith(root + '/'));
     for (const rel of Object.keys(expectedFiles)) {
       validateRelativePath(rel);
-      if (!withinSelection(rel)) fail('INVALID_CUSTOM_SELECTION');
+      if (!withinSelection(rel) || !selection.included(rel)) fail('INVALID_CUSTOM_SELECTION');
       const k = 'path:' + rel;
       files[k] = path.join(dir, rel);
       keys.push(k);
@@ -316,7 +407,7 @@ export async function handle(request) {
     try { await fs.mkdir(lockPath, { mode: 0o700 }); lock = lockPath; }
     catch (e) { if (e.code === 'EEXIST') fail('LOCK_BUSY'); throw e; }
     await safeLocation(request);
-    previous = addCustom(await readAll(), await customSnapshot(dir, selections));
+    previous = addCustom(await readAll(), await customSnapshot(dir, selections, false, rules));
     checkExpected(previous);
     // A baseline must never acknowledge a shared file that has not been installed.
     const changed = [...keys.filter(k => k !== 'state'), ...(keys.includes('state') ? ['state'] : [])].filter((k) => own(writes, k) && digest(writes[k]) !== previous[k].hash);
@@ -381,7 +472,7 @@ export async function handle(request) {
     }
     return { ok: true, applied, backupPath, atomic: false };
   } catch (e) {
-    return { ok: false, error: { code: e.workerCode ?? ({ EACCES: 'PERMISSION_DENIED', EPERM: 'PERMISSION_DENIED', ENOSPC: 'DISK_FULL', EROFS: 'READ_ONLY_FILESYSTEM' })[e.code] ?? 'IO_ERROR' }, applied, ...(backupPath ? { backupPath } : {}), partial: applied.length > 0 };
+    return { ok: false, error: { ...(e.detail ? { detail: e.detail } : {}), code: e.workerCode ?? ({ EACCES: 'PERMISSION_DENIED', EPERM: 'PERMISSION_DENIED', ENOSPC: 'DISK_FULL', EROFS: 'READ_ONLY_FILESYSTEM' })[e.code] ?? 'IO_ERROR' }, applied, ...(backupPath ? { backupPath } : {}), partial: applied.length > 0 };
   } finally {
     for (const tmp of temps) await fs.unlink(tmp).catch(() => {});
     if (lock) await fs.rmdir(lock).catch(() => {});

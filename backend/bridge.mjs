@@ -68,6 +68,9 @@ async function dispatch(message) {
   try {
     let result;
     switch (message.op) {
+      case "contents":
+        result = await engine.contents(message);
+        break;
       case "preview":
         result = review(await engine.preview(message));
         break;
@@ -103,7 +106,7 @@ async function dispatch(message) {
     }
     write({ id, ok: true, ...result });
   } catch (e) {
-    write({ id, ok: false, error: { code: safeError(e) } });
+    write({ id, ok: false, error: { code: safeError(e), ...(e.errorDetail ? { detail: e.errorDetail } : {}) } });
   }
 }
 function line(text) {

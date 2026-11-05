@@ -17,6 +17,7 @@ zeroize.workspace = true
 tempfile.workspace = true
 directories = "6"
 similar = "=2.7.0"
+unicode-normalization = "0.1"
 
 
 [dev-dependencies]

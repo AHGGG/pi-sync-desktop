@@ -47,3 +47,7 @@ For native rendered fixtures, build `cargo build --locked -p pi-sync-desktop --f
 ## Distribution
 
 The supported development entry point is Cargo. No npm package or installer is published. Prefer signed native releases first. A future `npx` wrapper can map OS/architecture to a pinned signed release and verified checksum, then spawn the binary without a browser engine. Avoid an installer that downloads and runs an unversioned `latest` executable.
+
+## Contents tree validation
+
+Use `--fixture-contents` with the native render-check binary for a synthetic tri-state tree containing source/target metadata and an excluded oversized log. No real device is contacted. Native production tests cover branch expansion, nested choices, portable aliases, explicit suggestions, save acknowledgment, cancellation, source-inventory recovery and independent target errors. The worker inventory reads metadata only; file bytes remain in the existing private review/apply path.

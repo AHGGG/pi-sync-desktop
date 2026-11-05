@@ -27,12 +27,14 @@ fn main() -> anyhow::Result<()> {
             "--fixture-overlay-idle" | "--fixture-overlay-hover" | "--fixture-overlay-selected"
         )
     });
+    let fixture_contents = std::env::args().any(|arg| arg == "--fixture-contents");
     let fixture_full_file = std::env::args().any(|arg| arg == "--fixture-full-file");
     let fixture_picker_macos = std::env::args().any(|arg| arg == "--fixture-picker-macos");
     let fixture_picker =
         fixture_picker_macos || std::env::args().any(|arg| arg == "--fixture-picker");
-    let fixture_selection =
-        fixture_picker || std::env::args().any(|arg| arg == "--fixture-selection");
+    let fixture_selection = fixture_contents
+        || fixture_picker
+        || std::env::args().any(|arg| arg == "--fixture-selection");
     let fixture_next_file = std::env::args().any(|arg| arg == "--fixture-next-file");
     let fixture_navigation = fixture_next_file
         || fixture_overlay.is_some()
@@ -114,6 +116,73 @@ fn main() -> anyhow::Result<()> {
             );
         }
     }
+    if fixture_contents {
+        let ui_model::Event::Snapshot(snapshot) = &mut initial else {
+            unreachable!()
+        };
+        snapshot.contents_loaded = true;
+        snapshot.contents_source_ready = true;
+        snapshot
+            .content_rules
+            .insert("extensions/debug.log".into(), false);
+        snapshot.content_entries = vec![
+            ui_model::ContentEntry {
+                path: "extensions".into(),
+                kind: "directory".into(),
+                device: "Source · this computer (fixture)".into(),
+                bytes: None,
+                issue: None,
+                suggested: false,
+                omitted: false,
+            },
+            ui_model::ContentEntry {
+                path: "extensions/settings.json".into(),
+                kind: "file".into(),
+                device: "Source · this computer (fixture)".into(),
+                bytes: Some(1840),
+                issue: None,
+                suggested: false,
+                omitted: false,
+            },
+            ui_model::ContentEntry {
+                path: "extensions/settings.json".into(),
+                kind: "file".into(),
+                device: "Target · example workstation (fixture)".into(),
+                bytes: Some(1520),
+                issue: None,
+                suggested: false,
+                omitted: false,
+            },
+            ui_model::ContentEntry {
+                path: "extensions/debug.log".into(),
+                kind: "file".into(),
+                device: "Source · this computer (fixture)".into(),
+                bytes: Some(6291456),
+                issue: Some("Exceeds 4 MiB per-file limit".into()),
+                suggested: true,
+                omitted: false,
+            },
+            ui_model::ContentEntry {
+                path: "skills".into(),
+                kind: "directory".into(),
+                device: "Source · this computer (fixture)".into(),
+                bytes: None,
+                issue: None,
+                suggested: false,
+                omitted: false,
+            },
+            ui_model::ContentEntry {
+                path: "skills/example.md".into(),
+                kind: "file".into(),
+                device: "Source · this computer (fixture)".into(),
+                bytes: Some(512),
+                issue: None,
+                suggested: false,
+                omitted: false,
+            },
+        ];
+        initial = ui_model::Event::ContentsLoaded(snapshot.clone());
+    }
     let mut context = HeadlessAppContext::with_platform(
         gpui_kit::platform::current_platform(true).text_system(),
         Arc::new(assets::AppAssets),
@@ -160,6 +229,9 @@ fn main() -> anyhow::Result<()> {
         if fixture_review {
             assert_eq!(window.find("apply-reviewed").disabled(), Some(true));
             assert!(window.find_all("prepare-review").is_empty());
+        } else if fixture_contents {
+            assert!(!window.find_all("choose-contents").is_empty());
+            assert_ne!(window.find("continue-contents").disabled(), Some(true));
         } else if window.find_all("prepare-review").is_empty() {
             assert_eq!(window.find("setup-next").disabled(), Some(true));
         } else {

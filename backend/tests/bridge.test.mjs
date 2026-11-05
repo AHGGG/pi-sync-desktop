@@ -198,3 +198,26 @@ test('only an approved per-file response bypasses private content redaction', as
   await request({ op: 'discard', planId: resolved.planId });
   assert.equal((await request({ ...base, planId: resolved.planId, approved: true })).error.code, 'PLAN_NOT_FOUND');
 });
+
+test('contents bridge forwards rule-aware metadata to both remote devices', async t => {
+  const calls = [];
+  const request = bridge(t, async message => {
+    calls.push(message);
+    return { ok: true, entries: [{ path: 'extensions/cache', kind: 'directory', size: null, omitted: true }] };
+  });
+  const contentRules = { 'extensions/cache': false };
+  const response = await request({ op: 'contents', source: { id: 'source', type: 'ssh', agentDir: '~/.pi/agent' }, targets: [{ id: 'target', type: 'ssh', agentDir: '~/.pi/agent' }], paths: ['extensions'], contentRules });
+  assert.equal(response.ok, true);
+  assert.equal(response.devices.length, 2);
+  assert.equal(response.limits.fileBytes, 4194304);
+  assert.equal(calls.length, 2);
+  for (const call of calls) { assert.equal(call.request.op, 'contents'); assert.deepEqual(call.request.contentRules, contentRules); }
+});
+
+test('source limit errors retain actionable metadata through bridge', async t => {
+  const request = bridge(t, async () => ({ ok: false, error: { code: 'FILE_TOO_LARGE', detail: { path: 'extensions/logs/a.log', size: 5000000, limit: 4194304, kind: 'fileBytes' } } }));
+  const response = await request({ op: 'preview', source: { id: 'source', type: 'ssh', agentDir: '~/.pi/agent' }, targets: [{ id: 'target', type: 'ssh', agentDir: '~/.pi/agent' }], items: ['path:extensions'] });
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, 'FILE_TOO_LARGE');
+  assert.deepEqual(response.error.detail, { deviceId: 'source', path: 'extensions/logs/a.log', size: 5000000, limit: 4194304, kind: 'fileBytes' });
+});

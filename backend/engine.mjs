@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import { latestPublic } from "./public-source.mjs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { handle, decodeModels, validateRelativePath, validatePathCollisions } from "./worker.mjs";
+import { handle, decodeModels, validateRelativePath, validatePathCollisions, validateContentRules, CONTENT_LIMITS } from "./worker.mjs";
 import { SCHEMAS, validateDocument, mergeDocuments } from "./documents.mjs";
 import { cell, object, same, mergeDocument } from "./merge.mjs";
 const fail = (code) => {
@@ -152,13 +152,29 @@ export class SyncEngine {
     this.remote = remote;
   }
   async call(t, request) {
-    return checked(
+    try { return checked(
       await (t.type === "local"
         ? handle({ ...request, agentDir: t.agentDir })
         : this.remote
           ? this.remote(t, { ...request, agentDir: t.agentDir })
           : Promise.reject(new Error("SSH_UNAVAILABLE"))),
-    );
+    ); } catch (e) {
+      if (e.workerResult?.error?.detail) e.errorDetail = { ...e.workerResult.error.detail, deviceId: t.id };
+      throw e;
+    }
+  }
+  async contents(input) {
+    if (!object(input) || !Array.isArray(input.paths) || !Array.isArray(input.targets)) fail("INVALID_SELECTION");
+    const source = target(input.source);
+    const targets = input.targets.map(target);
+    const devices = [];
+    for (const [device, role] of [[source, "source"], ...targets.map(t => [t, "target"])]) {
+      try {
+        const result = await this.call(device, { op: "contents", paths: input.paths, contentRules: input.contentRules });
+        devices.push({ id: device.id, role, entries: result.entries, ...(result.error ? { error: result.error } : {}) });
+      } catch (e) { devices.push({ id: device.id, role, entries: [], error: safeError(e) }); }
+    }
+    return { devices, limits: CONTENT_LIMITS };
   }
   async source(input) {
     const documents = input.items.filter((k) => k !== "models" && !k.startsWith("path:")),
@@ -198,7 +214,7 @@ export class SyncEngine {
             op: "snapshot",
             documents,
             includeModels: false,
-            paths, requirePaths: true,
+            paths, requirePaths: true, contentRules: input.contentRules,
           })
         : {};
       customFiles = snapshot.customFiles ?? {};
@@ -264,6 +280,7 @@ export class SyncEngine {
     if (!Array.isArray(input.targets) || !input.targets.length)
       fail("TARGET_REQUIRED");
     input = structuredClone(input);
+    input.contentRules = validateContentRules(input.contentRules);
     input.targets = input.targets.map(target);
     if (new Set(input.targets.map((t) => t.id)).size !== input.targets.length)
       fail("DUPLICATE_TARGET");
@@ -311,6 +328,7 @@ export class SyncEngine {
           op: "snapshot",
           documents: Object.keys(source.values),
           includeModels: !!source.models,
+          contentRules: input.contentRules,
           paths: input.items.filter(k => k.startsWith("path:")).map(k => k.slice(5)),
         });
         const merged = mergeDocuments(
@@ -352,7 +370,7 @@ export class SyncEngine {
         reviews.push({ id: t.id, status, documents, models, files });
         prepared.push({ target: t, snapshot, merged, status, models, files });
       } catch (e) {
-        reviews.push({ id: t.id, status: "blocked", error: safeError(e) });
+        reviews.push({ id: t.id, status: "blocked", error: safeError(e), ...(e.errorDetail ? { errorDetail: e.errorDetail } : {}) });
       }
     }
     const planId = randomUUID();
@@ -592,6 +610,7 @@ export class SyncEngine {
           op: "apply",
           expected: hashes(item.snapshot),
           retainOneBackup: true,
+          contentRules: plan.input.contentRules,
           paths: plan.input.items.filter(k => k.startsWith("path:")).map(k => k.slice(5)),
           expectedDirectories: item.snapshot.customDirectories,
           expectedFiles: Object.fromEntries(item.files.map(f => [f.path, f.targetHash])),
@@ -623,6 +642,7 @@ export class SyncEngine {
           id,
           status: "failed",
           error: safeError(e),
+          ...(e.errorDetail ? { errorDetail: e.errorDetail } : {}),
           outcome: "inspect-and-preview-again",
           applied,
           partial: worker?.partial === true || applied.length > 0,

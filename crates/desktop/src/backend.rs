@@ -1,6 +1,7 @@
 //! Blocking I/O lives on one worker. The native view receives presentation only.
 use crate::ui_model::{
-    Change, Choice, Command, ConfigItem, Device, Event, FilePreview, FileReviewDetails, Snapshot,
+    Change, Choice, Command, ConfigItem, ContentEntry, Device, Event, FilePreview,
+    FileReviewDetails, Snapshot,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,8 @@ const MAX_PROTOCOL_BYTES: usize = 48 * 1024 * 1024;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Selection {
+    #[serde(default)]
+    content_rules: BTreeMap<String, bool>,
     source: String,
     targets: Vec<String>,
     items: Vec<String>,
@@ -354,6 +357,40 @@ impl Backend {
                 self.cancel_operation();
                 self.publish();
             }
+            Command::LoadContents {
+                source,
+                targets,
+                items,
+                content_rules,
+            } => {
+                self.load_contents(Selection {
+                    source,
+                    targets,
+                    items,
+                    content_rules,
+                })?;
+            }
+            Command::SaveContentRules {
+                source,
+                targets,
+                items,
+                content_rules,
+            } => {
+                self.save_selection(Selection {
+                    source,
+                    targets,
+                    items,
+                    content_rules,
+                })?;
+                self.invalidate();
+                let _ = self.events.send(Event::ContentRulesSaved {
+                    content_rules: self.snapshot.content_rules.clone(),
+                    has_last_selection: self
+                        .last
+                        .as_ref()
+                        .is_some_and(|s| !s.items.is_empty() && !s.targets.is_empty()),
+                });
+            }
             Command::Refresh => {
                 self.invalidate();
                 self.snapshot.blocked_targets.clear();
@@ -426,12 +463,14 @@ impl Backend {
                 self.snapshot.target_ids.retain(|target| target != &id);
                 if self.snapshot.source_id.as_ref() == Some(&id) {
                     self.snapshot.source_id = Some("local".into());
+                    self.snapshot.content_rules.clear();
                     self.snapshot.selected_item_ids.clear();
                     self.snapshot.target_ids.retain(|target| target != "local");
                 }
                 self.invalidate();
                 self.snapshot.blocked_targets.clear();
                 self.save_selection(Selection {
+                    content_rules: self.snapshot.content_rules.clone(),
                     source: self.snapshot.source_id.clone().unwrap_or_else(|| "local".into()),
                     targets: self.snapshot.target_ids.clone(),
                     items: self.snapshot.selected_item_ids.clone(),
@@ -447,6 +486,7 @@ impl Backend {
                     return Ok(());
                 }
                 self.save_selection(Selection {
+                    content_rules: BTreeMap::new(),
                     source: id.clone(),
                     targets: self
                         .snapshot
@@ -472,6 +512,7 @@ impl Backend {
                 targets,
                 items,
             } => self.prepare(Selection {
+                content_rules: self.rules_for_source(&source),
                 source,
                 targets,
                 items,
@@ -482,6 +523,7 @@ impl Backend {
                 items,
             } => {
                 self.save_selection(Selection {
+                    content_rules: self.rules_for_source(&source),
                     source,
                     targets,
                     items,
@@ -510,7 +552,11 @@ impl Backend {
                     .last
                     .clone()
                     .context("There is no previous selection yet")?;
-                self.prepare(selection)?;
+                if selection.items.iter().any(|item| item.starts_with("path:")) {
+                    self.load_contents(selection)?;
+                } else {
+                    self.prepare(selection)?;
+                }
             }
             Command::ReviewFile {
                 plan_id,
@@ -591,6 +637,7 @@ impl Backend {
         // Validate the entire batch before changing disk, selection, or review state.
         let items = selected_local_items(root, &paths, items)?;
         self.save_selection(Selection {
+            content_rules: self.rules_for_source("local"),
             source: "local".into(),
             targets,
             items,
@@ -631,6 +678,7 @@ impl Backend {
             if self.source(&saved.source).is_err() {
                 saved.source = "local".into();
                 saved.items.clear();
+                saved.content_rules.clear();
             }
             saved
                 .targets
@@ -639,6 +687,7 @@ impl Backend {
                 self.snapshot.source_id = Some(saved.source.clone());
                 self.snapshot.selected_item_ids = saved.items.clone();
                 self.snapshot.target_ids = saved.targets.clone();
+                self.snapshot.content_rules = saved.content_rules.clone();
                 self.last = Some(saved);
             } else {
                 self.last = None;
@@ -659,10 +708,149 @@ impl Backend {
         write_selection(&self.config_dir.join("last-selection.json"), &selection).context(
             "The selection could not be saved. Your previous saved selection is unchanged",
         )?;
+        if self.snapshot.source_id.as_deref() != Some(&selection.source)
+            || self.snapshot.selected_item_ids != selection.items
+            || self.snapshot.target_ids != selection.targets
+        {
+            self.snapshot.contents_loaded = false;
+            self.snapshot.content_entries.clear();
+            self.snapshot.contents_errors.clear();
+        }
+        self.snapshot.content_rules = selection.content_rules.clone();
         self.snapshot.source_id = Some(selection.source.clone());
         self.snapshot.selected_item_ids = selection.items.clone();
         self.snapshot.target_ids = selection.targets.clone();
         self.last = Some(selection);
+        Ok(())
+    }
+    fn rules_for_source(&self, source: &str) -> BTreeMap<String, bool> {
+        if self.snapshot.source_id.as_deref() == Some(source) {
+            self.snapshot.content_rules.clone()
+        } else {
+            BTreeMap::new()
+        }
+    }
+    fn load_contents(&mut self, selection: Selection) -> Result<()> {
+        self.validate_selection(&selection)?;
+        ensure!(
+            !selection.targets.is_empty(),
+            "Choose at least one target device"
+        );
+        let paths = selection
+            .items
+            .iter()
+            .filter_map(|item| item.strip_prefix("path:"))
+            .collect::<Vec<_>>();
+        ensure!(!paths.is_empty(), "Choose a file or folder to inspect");
+        self.invalidate();
+        self.snapshot.contents_loaded = false;
+        self.snapshot.content_entries.clear();
+        self.snapshot.contents_errors.clear();
+        self.snapshot.results.clear();
+        self.connection_errors.clear();
+        self.save_selection(selection.clone())?;
+        self.busy("Listing file names and sizes. File contents stay private…");
+        let source = self.source(&selection.source)?;
+        let targets = selection
+            .targets
+            .iter()
+            .map(|id| self.target(id))
+            .collect::<Result<Vec<_>>>()?;
+        let result = self.call(json!({"op":"contents", "source":source, "targets":targets,
+            "paths":paths, "contentRules": scoped_content_rules(&selection)}))?;
+        self.set_contents(&result, &selection)?;
+        let _ = self
+            .events
+            .send(Event::ContentsLoaded(self.snapshot.clone()));
+        Ok(())
+    }
+    fn set_contents(&mut self, result: &Value, selection: &Selection) -> Result<()> {
+        let devices = result["devices"]
+            .as_array()
+            .context("Invalid contents response")?;
+        ensure!(
+            devices.len() == selection.targets.len() + 1,
+            "Incomplete contents response"
+        );
+        let mut seen = HashSet::new();
+        let mut entries = Vec::new();
+        let mut errors = Vec::new();
+        let mut source_ready = true;
+        for device in devices {
+            let id = device["id"].as_str().context("Invalid contents device")?;
+            ensure!(
+                seen.insert(id)
+                    && (id == selection.source
+                        || selection.targets.iter().any(|target| target == id)),
+                "Invalid contents device"
+            );
+            let name = self.device_name(id);
+            let role = if id == selection.source {
+                "Source"
+            } else {
+                "Target"
+            };
+            if let Some(code) = device["error"].as_str() {
+                if id == selection.source {
+                    source_ready = false;
+                }
+                errors.push((
+                    format!("{role}: {name}"),
+                    self.connection_errors
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| explain(code)),
+                ));
+            }
+            for entry in device["entries"]
+                .as_array()
+                .context("Invalid contents entries")?
+            {
+                ensure!(
+                    entries.len() < 16384,
+                    "Too many file names to display. Select a smaller folder"
+                );
+                let path = entry["path"].as_str().context("Invalid contents path")?;
+                ensure!(
+                    path.len() <= 1024 && !path.chars().any(char::is_control),
+                    "An unsafe file name cannot be displayed. Select a smaller folder"
+                );
+                let key = crate::ui_model::content_key(path);
+                ensure!(
+                    selection
+                        .items
+                        .iter()
+                        .filter_map(|item| item.strip_prefix("path:"))
+                        .any(|root| {
+                            let root = crate::ui_model::content_key(root);
+                            key == root || key.starts_with(&format!("{root}/"))
+                        }),
+                    "Contents path is outside the selected folders"
+                );
+                let kind = entry["kind"].as_str().context("Invalid contents kind")?;
+                ensure!(
+                    ["file", "directory", "blocked", "missing"].contains(&kind),
+                    "Invalid contents kind"
+                );
+                let issue = entry["blocked"].as_str().map(explain).or_else(|| {
+                    (kind == "missing" && id == selection.source)
+                        .then(|| explain("SOURCE_CUSTOM_PATH_MISSING"))
+                });
+                entries.push(ContentEntry {
+                    path: path.to_owned(),
+                    kind: kind.to_owned(),
+                    device: format!("{role}: {name}"),
+                    bytes: entry["size"].as_u64(),
+                    issue,
+                    omitted: entry["omitted"] == true,
+                    suggested: matches!(entry["suggestedExclude"].as_str(), Some("logs" | "cache")),
+                });
+            }
+        }
+        self.snapshot.content_entries = entries;
+        self.snapshot.contents_errors = errors;
+        self.snapshot.contents_source_ready = source_ready;
+        self.snapshot.contents_loaded = true;
         Ok(())
     }
     fn prepare(&mut self, selection: Selection) -> Result<()> {
@@ -688,7 +876,8 @@ impl Backend {
             .map(|id| self.target(id))
             .collect::<Result<Vec<_>>>()?;
         let result = self.call(
-            json!({"op":"preview","source":source,"targets":targets,"items":selection.items}),
+            json!({"op":"preview","source":source,"targets":targets,"items":selection.items,
+                "contentRules": scoped_content_rules(&selection)}),
         ).map_err(|error| {
             if error.to_string() == explain("SOURCE_CUSTOM_PATH_MISSING") {
                 let paths = selection.items.iter().filter_map(|item| item.strip_prefix("path:")).collect::<Vec<_>>().join(", ");
@@ -728,7 +917,10 @@ impl Backend {
                 self.snapshot.blocked_targets.push((
                     name.clone(),
                     self.connection_errors.get(&id).cloned().unwrap_or_else(|| {
-                        explain(target["error"].as_str().unwrap_or("TARGET_FAILED"))
+                        self.describe_error(
+                            target["error"].as_str().unwrap_or("TARGET_FAILED"),
+                            &target["errorDetail"],
+                        )
                     }),
                 ));
             }
@@ -931,7 +1123,10 @@ impl Backend {
                 Some("unchanged") => "Already up to date".into(),
                 _ => format!(
                     "{} · inspect and prepare again before retrying",
-                    explain(target["error"].as_str().unwrap_or("TARGET_FAILED"))
+                    self.describe_error(
+                        target["error"].as_str().unwrap_or("TARGET_FAILED"),
+                        &target["errorDetail"]
+                    )
                 ),
             };
             if let Some(files) = target["files"]
@@ -958,6 +1153,38 @@ impl Backend {
         }
         self.publish();
         Ok(())
+    }
+    fn describe_error(&self, code: &str, detail: &Value) -> String {
+        let Some(path) = detail["path"]
+            .as_str()
+            .filter(|path| path.len() <= 1024 && !path.chars().any(char::is_control))
+        else {
+            return explain(code);
+        };
+        let Some(size) = detail["size"].as_u64() else {
+            return explain(code);
+        };
+        let Some(limit) = detail["limit"].as_u64() else {
+            return explain(code);
+        };
+        let device = detail["deviceId"]
+            .as_str()
+            .map(|id| self.device_name(id))
+            .unwrap_or_else(|| "Selected device".into());
+        let kind = match detail["kind"].as_str() {
+            Some("fileBytes") => "file size",
+            Some("totalBytes") => "selected total",
+            Some("files") => "file count",
+            _ => return explain(code),
+        };
+        format!(
+            "{device}: {path} exceeds the {kind} limit ({size} vs {limit} {}). Return to Choose contents and exclude this file or folder, or deselect it. Limits remain 4 MiB per file, 8 MiB total and 256 files.",
+            if kind == "file count" {
+                "files"
+            } else {
+                "bytes"
+            }
+        )
     }
     fn device_name(&self, id: &str) -> String {
         if id == "local" {
@@ -1060,15 +1287,15 @@ impl Backend {
                     .send(&message)?;
             } else if value["id"] == id {
                 if value["ok"] != true {
-                    bail!(
-                        "{}",
-                        explain(
-                            value["error"]
-                                .as_str()
-                                .or_else(|| value["error"]["code"].as_str())
-                                .unwrap_or("SYNC_FAILED")
-                        )
-                    );
+                    let code = value["error"]
+                        .as_str()
+                        .or_else(|| value["error"]["code"].as_str())
+                        .unwrap_or("SYNC_FAILED");
+                    let detail = value
+                        .get("errorDetail")
+                        .or_else(|| value["error"].get("detail"))
+                        .unwrap_or(&Value::Null);
+                    bail!("{}", self.describe_error(code, detail));
                 }
                 return Ok(value.get("result").cloned().unwrap_or(value));
             }
@@ -1427,6 +1654,7 @@ fn selected_local_items(
         }
     }
     validate_selection_shape(&Selection {
+        content_rules: BTreeMap::new(),
         source: "local".into(),
         targets: vec![],
         items: items.clone(),
@@ -1483,6 +1711,8 @@ fn explain(code: &str) -> String {
         "INVALID_CUSTOM_PATH" => "Choose a relative file or folder inside the Pi directory",
         "PUBLIC_CUSTOM_PATHS_FORBIDDEN" => "Custom files require a device source",
         "CUSTOM_PATH_COLLISION" => "Selected paths collide on another platform (case or Unicode spelling). Rename them before syncing",
+        "CONTENT_INVENTORY_TOO_LARGE" => "This folder has too many entries to list safely. Exclude a large branch such as logs or cache and refresh contents, or choose a smaller folder",
+        "INVALID_CONTENT_RULES" => "The saved content choices are invalid. Adjust the checked files and folders, then refresh contents",
         "CUSTOM_SELECTION_TOO_LARGE" => "Choose a smaller folder or fewer files: custom sync allows 256 files, 4 MiB per file, 8 MiB total and 32 folder levels",
         "CUSTOM_PATH_CHANGED" | "CONCURRENT_UPDATE" => "A selected file changed during sync. Inspect the results and prepare a fresh review",
         "INVALID_CUSTOM_SELECTION" => "The selected file paths are invalid. Choose paths relative to the Pi directory",
@@ -1533,7 +1763,64 @@ fn explain(code: &str) -> String {
     }
     .into()
 }
+fn scoped_content_rules(selection: &Selection) -> BTreeMap<String, bool> {
+    use crate::ui_model::content_key;
+    let roots = selection
+        .items
+        .iter()
+        .filter_map(|item| item.strip_prefix("path:"))
+        .map(content_key)
+        .collect::<Vec<_>>();
+    selection
+        .content_rules
+        .iter()
+        .filter(|(path, _)| {
+            let path = content_key(path);
+            roots.iter().any(|root| {
+                path == *root
+                    || path.starts_with(&format!("{root}/"))
+                    || root.starts_with(&format!("{path}/"))
+            })
+        })
+        .map(|(path, included)| (path.clone(), *included))
+        .collect()
+}
+fn validate_content_rules(rules: &BTreeMap<String, bool>) -> Result<()> {
+    use crate::ui_model::content_key;
+    ensure!(
+        rules.len() <= 1024,
+        "Too many content choices. Select fewer folders"
+    );
+    let mut seen = HashSet::new();
+    for (path, included) in rules {
+        let key = content_key(path);
+        ensure!(
+            !path.is_empty()
+                && path.len() <= 1024
+                && !path.chars().any(char::is_control)
+                && !path.contains(['\\', ':', '?', '*', '<', '>', '|', '"'])
+                && path
+                    .split('/')
+                    .all(|part| !part.is_empty() && part != "." && part != "..")
+                && key
+                    .split('/')
+                    .all(|part| !part.is_empty() && part != "." && part != "..")
+                && seen.insert(key.clone()),
+            "Invalid or overlapping content choice"
+        );
+        if *included {
+            validate_selection_shape(&Selection {
+                source: "local".into(),
+                targets: vec![],
+                items: vec![format!("path:{key}")],
+                content_rules: BTreeMap::new(),
+            })?;
+        }
+    }
+    Ok(())
+}
 fn validate_selection_shape(selection: &Selection) -> Result<()> {
+    validate_content_rules(&selection.content_rules)?;
     let valid_id = |id: &str| {
         !id.is_empty()
             && id.len() <= 60
@@ -1790,6 +2077,7 @@ mod tests {
         }
         assert!(
             validate_selection_shape(&Selection {
+                content_rules: BTreeMap::new(),
                 source: "local".into(),
                 targets: vec![],
                 items: vec!["path:CON.txt".into()]
@@ -1944,6 +2232,7 @@ mod tests {
         );
         backend
             .save_selection(Selection {
+                content_rules: BTreeMap::new(),
                 source: "local".into(),
                 targets: vec![],
                 items: vec![],
@@ -1987,6 +2276,7 @@ mod tests {
         let mut backend = test_backend(dir.path());
         backend
             .save_selection(Selection {
+                content_rules: BTreeMap::new(),
                 source: "local".into(),
                 targets: vec![],
                 items: vec![],
@@ -2258,6 +2548,7 @@ mod tests {
         assert_eq!(backend.snapshot.source_id.as_deref(), Some("local"));
         assert!(backend.snapshot.selection_loaded);
         backend.last = Some(Selection {
+            content_rules: BTreeMap::new(),
             source: "local".into(),
             targets: vec!["removed-device".into()],
             items: vec!["path:extensions".into(), "path:permissions.json".into()],
@@ -2376,6 +2667,7 @@ mod tests {
         let second = backend.profiles[1].id.clone();
         backend
             .save_selection(Selection {
+                content_rules: BTreeMap::new(),
                 source: "local".into(),
                 targets: vec![first.clone(), second.clone()],
                 items: vec!["path:extensions".into()],
@@ -2389,6 +2681,7 @@ mod tests {
         assert_eq!(saved.items, vec!["path:extensions"]);
         backend
             .save_selection(Selection {
+                content_rules: BTreeMap::new(),
                 source: second.clone(),
                 targets: vec!["local".into()],
                 items: vec!["path:remote-only".into()],
@@ -2433,6 +2726,7 @@ mod tests {
     #[test]
     fn invalid_custom_selections_are_rejected_but_permission_files_are_explicitly_allowed() {
         let mut selection = Selection {
+            content_rules: BTreeMap::new(),
             source: "local".into(),
             targets: vec![],
             items: vec![],
@@ -2594,6 +2888,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("selection.json");
         let selection = Selection {
+            content_rules: BTreeMap::new(),
             source: "local".into(),
             targets: vec!["test".into()],
             items: vec!["settings".into()],
@@ -2873,5 +3168,235 @@ mod tests {
             assert!(!message.contains(code));
             assert!(!message.starts_with("Sync blocked:"));
         }
+    }
+    #[test]
+    fn content_rules_restore_and_survive_unrelated_selection_and_device_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = test_backend(dir.path());
+        backend.profiles.push(Profile {
+            id: "target".into(),
+            name: "Target".into(),
+            connection: ConnectionConfig::parse("ssh user@host").unwrap(),
+            agent_dir: "~/.pi/agent".into(),
+        });
+        let rules = BTreeMap::from([
+            ("extensions/plugin/logs".into(), false),
+            ("extensions/plugin/logs/README.md".into(), true),
+        ]);
+        backend
+            .save_selection(Selection {
+                source: "local".into(),
+                targets: vec!["target".into()],
+                items: vec!["path:extensions".into()],
+                content_rules: rules.clone(),
+            })
+            .unwrap();
+        backend
+            .handle(Command::SaveSelection {
+                source: "local".into(),
+                targets: vec!["target".into()],
+                items: vec!["settings".into()],
+            })
+            .unwrap();
+        assert_eq!(backend.snapshot.content_rules, rules);
+        backend
+            .handle(Command::RemoveDevice("target".into()))
+            .unwrap();
+        assert_eq!(backend.snapshot.content_rules, rules);
+        let mut restarted = test_backend(dir.path());
+        restarted.last = read_selection(&dir.path().join("last-selection.json")).unwrap();
+        restarted.restore_startup_selection_at(None);
+        assert_eq!(restarted.snapshot.content_rules, rules);
+        assert!(scoped_content_rules(restarted.last.as_ref().unwrap()).is_empty());
+    }
+    #[test]
+    fn missing_saved_source_does_not_leak_remote_exclusions_into_local_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = test_backend(dir.path());
+        backend.last = Some(Selection {
+            source: "removed".into(),
+            targets: vec!["local".into()],
+            items: vec!["path:extensions".into()],
+            content_rules: BTreeMap::from([("extensions/logs".into(), false)]),
+        });
+        backend.restore_startup_selection_at(None);
+        assert!(backend.snapshot.content_rules.is_empty());
+        assert!(backend.last.as_ref().unwrap().content_rules.is_empty());
+    }
+    #[test]
+    fn legacy_selection_has_no_silent_suggested_exclusions() {
+        let saved: Selection = serde_json::from_value(
+            json!({"source":"local", "targets":[], "items":["path:extensions"]}),
+        )
+        .unwrap();
+        assert!(saved.content_rules.is_empty());
+        validate_selection_shape(&saved).unwrap();
+    }
+    #[test]
+    fn content_rules_reject_injection_aliases_and_protected_reinclusion() {
+        for path in [
+            "../escape",
+            "/absolute",
+            "extensions/../escape",
+            "extensions/./x",
+            "extensions//x",
+            "extensions\\x",
+            "extensions/x\nfoo",
+        ] {
+            assert!(
+                validate_content_rules(&BTreeMap::from([(path.into(), false)])).is_err(),
+                "{path}"
+            );
+        }
+        assert!(
+            validate_content_rules(&BTreeMap::from([
+                ("extensions/Logs".into(), false),
+                ("extensions/logs".into(), true)
+            ]))
+            .is_err()
+        );
+        assert!(
+            validate_content_rules(&BTreeMap::from([("extensions/.cache".into(), false)])).is_ok()
+        );
+        assert!(
+            validate_content_rules(&BTreeMap::from([("extensions/.cache".into(), true)])).is_err()
+        );
+        assert!(
+            validate_content_rules(&BTreeMap::from([(
+                "extensions/passwords.json".into(),
+                true
+            )]))
+            .is_err()
+        );
+        assert!(
+            validate_content_rules(&BTreeMap::from([(
+                "extensions/passwords.json".into(),
+                false
+            )]))
+            .is_ok()
+        );
+    }
+    #[test]
+    fn metadata_inventory_retains_sizes_without_private_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = test_backend(dir.path());
+        let selection = Selection {
+            source: "local".into(),
+            targets: vec!["remote".into()],
+            items: vec!["path:extensions".into()],
+            content_rules: BTreeMap::new(),
+        };
+        let response = json!({"devices":[
+            {"id":"local", "entries":[{"path":"extensions/logs/debug.log", "kind":"file", "size":19293798, "suggestedExclude":"logs", "base64":"PRIVATE-CONTENT"}]},
+            {"id":"remote", "entries":[{"path":"extensions/logs", "kind":"missing", "size":null}]}
+        ]});
+        backend.set_contents(&response, &selection).unwrap();
+        assert!(backend.snapshot.contents_loaded);
+        assert_eq!(backend.snapshot.content_entries[0].bytes, Some(19293798));
+        assert!(backend.snapshot.content_entries[0].suggested);
+        assert!(backend.snapshot.content_entries[1].issue.is_none());
+        assert!(!format!("{:?}", backend.snapshot).contains("PRIVATE-CONTENT"));
+        let mut invalid = response;
+        invalid["devices"][1]["id"] = json!("injected");
+        assert!(backend.set_contents(&invalid, &selection).is_err());
+    }
+    #[test]
+    fn limit_errors_name_device_path_size_and_unchanged_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend(dir.path());
+        let error = backend.describe_error("FILE_TOO_LARGE", &json!({"deviceId":"local", "path":"extensions/logs/debug.log", "size":19293798, "limit":4194304, "kind":"fileBytes"}));
+        for expected in [
+            "This computer",
+            "extensions/logs/debug.log",
+            "19293798",
+            "4194304",
+            "Choose contents",
+            "4 MiB",
+            "8 MiB",
+        ] {
+            assert!(error.contains(expected));
+        }
+    }
+    #[test]
+    fn embedded_bridge_lists_large_file_then_reviews_filtered_scope() {
+        let dir = picker_tempdir();
+        let source_root = dir.path().join("source");
+        let target_root = dir.path().join("target");
+        for root in [&source_root, &target_root] {
+            fs::create_dir_all(root.join("extensions/plugin/logs")).unwrap();
+            fs::write(
+                root.join("extensions/plugin/logs/large.log"),
+                vec![b'x'; 5 * 1024 * 1024],
+            )
+            .unwrap();
+        }
+        fs::write(source_root.join("extensions/plugin/index.js"), "new code").unwrap();
+        fs::write(target_root.join("extensions/plugin/index.js"), "old code").unwrap();
+        let mut backend = test_backend(&dir.path().join("app"));
+        let source = json!({"id":"local", "type":"local", "agentDir":source_root});
+        let targets = json!([{"id":"target", "type":"local", "agentDir":target_root}]);
+        let contents = backend.call(json!({"op":"contents", "source":source, "targets":targets, "paths":["extensions"]})).unwrap();
+        let selection = Selection {
+            source: "local".into(),
+            targets: vec!["target".into()],
+            items: vec!["path:extensions".into()],
+            content_rules: BTreeMap::new(),
+        };
+        backend.set_contents(&contents, &selection).unwrap();
+        assert!(
+            backend
+                .snapshot
+                .content_entries
+                .iter()
+                .any(|entry| entry.bytes == Some(5 * 1024 * 1024))
+        );
+        assert!(backend.snapshot.contents_source_ready);
+        let result = backend.call(json!({"op":"preview", "source":source, "targets":targets, "items":["path:extensions"], "contentRules":{"extensions/plugin/logs":false}})).unwrap();
+        let files = result["targets"][0]["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], "extensions/plugin/index.js");
+        assert!(
+            backend
+                .snapshot
+                .content_entries
+                .iter()
+                .all(|entry| !entry.path.contains("new code"))
+        );
+    }
+    #[test]
+    fn content_rule_acknowledgment_is_exact_and_failed_save_does_not_acknowledge() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = test_backend(dir.path());
+        let (events, received) = mpsc::channel();
+        backend.events = events;
+        let rules = BTreeMap::from([("extensions/logs".into(), false)]);
+        backend
+            .handle(Command::SaveContentRules {
+                source: "local".into(),
+                targets: vec![],
+                items: vec!["path:extensions".into()],
+                content_rules: rules.clone(),
+            })
+            .unwrap();
+        assert!(
+            matches!(received.try_recv().unwrap(), Event::ContentRulesSaved { content_rules, .. } if content_rules == rules)
+        );
+        let saved = fs::read(dir.path().join("last-selection.json")).unwrap();
+        assert!(
+            backend
+                .handle(Command::SaveContentRules {
+                    source: "local".into(),
+                    targets: vec![],
+                    items: vec!["path:extensions".into()],
+                    content_rules: BTreeMap::from([("../escape".into(), false)])
+                })
+                .is_err()
+        );
+        assert!(received.try_recv().is_err());
+        assert_eq!(
+            fs::read(dir.path().join("last-selection.json")).unwrap(),
+            saved
+        );
+        assert_eq!(backend.snapshot.content_rules, rules);
     }
 }

@@ -1,6 +1,24 @@
 //! Presentation contract. Only the worker owns SSH, disk I/O, and sync plans.
 //! Credentials are one-shot command payloads, never part of snapshots.
 use std::collections::{BTreeMap, BTreeSet};
+use unicode_normalization::UnicodeNormalization;
+
+pub(crate) fn content_key(path: &str) -> String {
+    path.nfkc().collect::<String>().to_lowercase()
+}
+pub(crate) fn content_included(path: &str, rules: &BTreeMap<String, bool>) -> bool {
+    let path = content_key(path);
+    rules
+        .iter()
+        .filter_map(|(root, included)| {
+            let root = content_key(root);
+            (path == root || path.starts_with(&format!("{root}/")))
+                .then_some((root.len(), *included))
+        })
+        .max_by_key(|(length, _)| *length)
+        .map(|(_, included)| included)
+        .unwrap_or(true)
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct Device {
@@ -39,8 +57,23 @@ pub(crate) struct FileReviewDetails {
     pub target_hash: Option<String>,
     pub permission_policy: bool,
 }
+#[derive(Clone, Debug)]
+pub(crate) struct ContentEntry {
+    pub path: String,
+    pub kind: String,
+    pub device: String,
+    pub bytes: Option<u64>,
+    pub issue: Option<String>,
+    pub suggested: bool,
+    pub omitted: bool,
+}
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Snapshot {
+    pub content_rules: BTreeMap<String, bool>,
+    pub content_entries: Vec<ContentEntry>,
+    pub contents_loaded: bool,
+    pub contents_source_ready: bool,
+    pub contents_errors: Vec<(String, String)>,
     pub devices: Vec<Device>,
     pub source_id: Option<String>,
     pub items: Vec<ConfigItem>,
@@ -59,6 +92,18 @@ pub(crate) struct Snapshot {
 }
 /// Deliberately not Debug: credential payloads must never reach logs.
 pub(crate) enum Command {
+    LoadContents {
+        source: String,
+        targets: Vec<String>,
+        items: Vec<String>,
+        content_rules: BTreeMap<String, bool>,
+    },
+    SaveContentRules {
+        source: String,
+        targets: Vec<String>,
+        items: Vec<String>,
+        content_rules: BTreeMap<String, bool>,
+    },
     ReviewFile {
         plan_id: String,
         change_id: String,
@@ -123,6 +168,11 @@ pub(crate) struct FilePreview {
     pub after: String,
 }
 pub(crate) enum Event {
+    ContentRulesSaved {
+        content_rules: BTreeMap<String, bool>,
+        has_last_selection: bool,
+    },
+    ContentsLoaded(Snapshot),
     FilePreview(FilePreview),
     Snapshot(Snapshot),
     LocalPathsAdded(Snapshot),
@@ -293,5 +343,16 @@ mod tests {
         let choices = BTreeMap::from([("device/settings/theme".into(), Choice::Target)]);
         assert_eq!(snapshot.unresolved_count(&choices), 0);
         assert!(snapshot.reviewed_choices(&choices).is_some());
+    }
+    #[test]
+    fn portable_content_rules_use_longest_prefix_and_nested_inclusion() {
+        let rules = BTreeMap::from([
+            ("extensions/ＬＯＧＳ".into(), false),
+            ("extensions/logs/keep.txt".into(), true),
+        ]);
+        assert!(!content_included("extensions/Logs/new.log", &rules));
+        assert!(content_included("extensions/LOGS/keep.txt", &rules));
+        assert!(content_included("extensions/logstash/index.js", &rules));
+        assert!(content_included("extensions/code.js", &rules));
     }
 }

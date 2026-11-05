@@ -117,6 +117,55 @@ fn review_content_click(event: &ClickEvent) -> bool {
     }
 }
 
+/// Listed subtotals are metadata only, never claims about unscanned bytes.
+fn listed_directory_bytes(entries: &[ContentEntry]) -> BTreeMap<(String, String), u64> {
+    let mut totals: BTreeMap<(String, String), u64> = BTreeMap::new();
+    for entry in entries {
+        if entry.kind != "file" {
+            continue;
+        }
+        let Some(bytes) = entry.bytes else {
+            continue;
+        };
+        let key = content_key(&entry.path);
+        let mut ancestor = key.rsplit_once('/').map(|(parent, _)| parent);
+        while let Some(parent) = ancestor {
+            let total = totals
+                .entry((entry.device.clone(), parent.into()))
+                .or_default();
+            *total = total.saturating_add(bytes);
+            ancestor = parent.rsplit_once('/').map(|(parent, _)| parent);
+        }
+    }
+    totals
+}
+
+fn content_size_label(entry: &ContentEntry, totals: &BTreeMap<(String, String), u64>) -> String {
+    let format_bytes = |bytes: u64| {
+        if bytes >= 1024 * 1024 {
+            format!("{:.2} MiB", bytes as f64 / (1024. * 1024.))
+        } else if bytes >= 1024 {
+            format!("{:.1} KiB", bytes as f64 / 1024.)
+        } else {
+            format!("{bytes} B")
+        }
+    };
+    if entry.omitted {
+        return "Excluded branch; include and refresh to list sizes".into();
+    }
+    if entry.kind == "directory" {
+        let bytes = totals
+            .get(&(entry.device.clone(), content_key(&entry.path)))
+            .copied()
+            .unwrap_or(0);
+        return format!("{} listed total (may be partial)", format_bytes(bytes));
+    }
+    entry
+        .bytes
+        .map(format_bytes)
+        .unwrap_or_else(|| "Size unavailable".into())
+}
+
 pub(crate) struct Workspace {
     commands: Sender<Command>,
     snapshot: Snapshot,
@@ -131,6 +180,9 @@ pub(crate) struct Workspace {
     initial_snapshot_received: bool,
     source_picker_open: bool,
     path_picker_open: bool,
+    contents_open: bool,
+    content_rules_saving: bool,
+    contents_expanded: BTreeSet<String>,
     review_change_id: Option<String>,
     review_pending_only: bool,
     review_hovered_side: Option<Choice>,
@@ -220,6 +272,9 @@ impl Workspace {
             initial_snapshot_received: false,
             source_picker_open: false,
             path_picker_open: false,
+            contents_open: false,
+            content_rules_saving: false,
+            contents_expanded: BTreeSet::new(),
             review_change_id: None,
             review_pending_only: false,
             review_hovered_side: None,
@@ -288,6 +343,13 @@ impl Workspace {
         {
             return;
         }
+        if self.selected.iter().any(|id| id.starts_with("path:")) {
+            self.load_contents(cx);
+            return;
+        }
+        self.prepare_diff(cx);
+    }
+    fn prepare_diff(&mut self, cx: &mut Context<Self>) {
         if let Some(source) = self.snapshot.source_id.clone() {
             self.send(
                 Command::Prepare {
@@ -302,6 +364,22 @@ impl Workspace {
     }
     pub(crate) fn receive(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
         match event {
+            Event::ContentsLoaded(snapshot) => {
+                // Only the current operation may open an inventory. Errors/cancel
+                // clear busy and cannot resurrect a stale response.
+                if self.busy.is_none() {
+                    return;
+                }
+                self.selected = snapshot.selected_item_ids.iter().cloned().collect();
+                self.targets = snapshot.target_ids.iter().cloned().collect();
+                self.receive(Event::Snapshot(snapshot), window, cx);
+                self.contents_open = true;
+                self.contents_expanded = self
+                    .selected
+                    .iter()
+                    .filter_map(|id| id.strip_prefix("path:").map(content_key))
+                    .collect();
+            }
             Event::Snapshot(snapshot) => {
                 self.close_file_review();
                 // Do not complete a press against preview content replaced mid-gesture.
@@ -432,6 +510,9 @@ impl Workspace {
                         ))
                     })
                     .collect();
+                if snapshot.source_id != self.snapshot.source_id || snapshot.plan_id.is_some() {
+                    self.contents_open = false;
+                }
                 self.snapshot = snapshot;
                 self.targets.retain(|id| {
                     self.snapshot.devices.iter().any(|d| &d.id == id)
@@ -502,6 +583,16 @@ impl Workspace {
                 self.error = None;
                 self.receive(Event::Snapshot(snapshot), window, cx);
             }
+            Event::ContentRulesSaved {
+                content_rules,
+                has_last_selection,
+            } => {
+                self.snapshot.has_last_selection = has_last_selection;
+                if self.content_rules_saving && content_rules == self.snapshot.content_rules {
+                    self.content_rules_saving = false;
+                    self.busy = None;
+                }
+            }
             Event::SelectionSaved { has_last_selection } => {
                 self.snapshot.has_last_selection = has_last_selection;
             }
@@ -513,6 +604,10 @@ impl Workspace {
                 self.close_file_review();
                 self.close_authentication(window, cx);
                 self.error = Some(message);
+                self.content_rules_saving = false;
+                if self.contents_open {
+                    self.snapshot.contents_loaded = false;
+                }
                 self.busy = None;
             }
             Event::TrustHost {
@@ -731,6 +826,9 @@ impl Workspace {
         });
     }
     fn save_selection(&mut self, cx: &mut Context<Self>) {
+        self.contents_open = false;
+        self.snapshot.contents_loaded = false;
+        self.snapshot.content_entries.clear();
         if let Some(source) = self.snapshot.source_id.clone()
             && self
                 .commands
@@ -918,6 +1016,8 @@ impl Workspace {
                     .text_color(cx.theme().muted_foreground)
                     .child(if self.onboarding {
                         "1  Connect your devices"
+                    } else if self.contents_open {
+                        "3  Choose contents"
                     } else if reviewing {
                         "Review changes"
                     } else {
@@ -925,21 +1025,24 @@ impl Workspace {
                     }),
             )
             .child(div().flex_1())
-            .when(!self.onboarding && !reviewing, |el| {
-                el.child(
-                    Button::new("repeat-last")
-                        .ghost()
-                        .label("Review saved selection")
-                        .disabled(self.is_busy() || !self.snapshot.has_last_selection)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.send(
-                                Command::RepeatLast,
-                                "Preparing a fresh review of your saved selection",
-                                cx,
-                            )
-                        })),
-                )
-            })
+            .when(
+                !self.onboarding && !reviewing && !self.contents_open,
+                |el| {
+                    el.child(
+                        Button::new("repeat-last")
+                            .ghost()
+                            .label("Review saved selection")
+                            .disabled(self.is_busy() || !self.snapshot.has_last_selection)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.send(
+                                    Command::RepeatLast,
+                                    "Preparing a fresh review of your saved selection",
+                                    cx,
+                                )
+                            })),
+                    )
+                },
+            )
             .when(!reviewing, |el| {
                 el.child(
                     Button::new("refresh")
@@ -948,6 +1051,8 @@ impl Workspace {
                         .disabled(self.is_busy())
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.invalidate_review();
+                            this.contents_open = false;
+                            this.snapshot.contents_loaded = false;
                             this.send(Command::Refresh, "Refreshing devices", cx);
                         })),
                 )
@@ -1133,6 +1238,223 @@ impl Workspace {
                 .child(Button::new("prepare-review").primary().w_full().label("Review changes →")
                     .disabled(busy || self.targets.is_empty() || self.selected.is_empty())
                     .on_click(cx.listener(|this, _, _, cx| this.prepare(cx)))))
+    }
+
+    fn load_contents(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.snapshot.source_id.clone() else {
+            return;
+        };
+        self.contents_open = true;
+        self.snapshot.contents_loaded = false;
+        self.snapshot.content_entries.clear();
+        self.snapshot.contents_errors.clear();
+        self.send(
+            Command::LoadContents {
+                source,
+                targets: self.targets.iter().cloned().collect(),
+                items: self.selected.iter().cloned().collect(),
+                content_rules: self.snapshot.content_rules.clone(),
+            },
+            "Reading folder metadata on source and targets",
+            cx,
+        );
+    }
+
+    fn save_content_rules(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_review();
+        if let Some(source) = self.snapshot.source_id.clone() {
+            self.content_rules_saving = true;
+            self.send(
+                Command::SaveContentRules {
+                    source,
+                    targets: self.targets.iter().cloned().collect(),
+                    items: self.selected.iter().cloned().collect(),
+                    content_rules: self.snapshot.content_rules.clone(),
+                },
+                "Saving your contents choices",
+                cx,
+            );
+            if self.busy.is_none() {
+                self.content_rules_saving = false;
+                self.snapshot.contents_loaded = false;
+            }
+        }
+        cx.notify();
+    }
+
+    fn set_content_rule(&mut self, path: &str, included: bool) {
+        let normalized = content_key(path);
+        let prefix = format!("{normalized}/");
+        // Excluded branches may have been pruned during inventory. Re-including
+        // must refresh their metadata rather than treating absent rows as safe.
+        if included
+            && (!content_included(path, &self.snapshot.content_rules)
+                || self
+                    .snapshot
+                    .content_rules
+                    .iter()
+                    .any(|(key, value)| !value && content_key(key).starts_with(&prefix)))
+        {
+            self.snapshot.contents_loaded = false;
+        }
+        self.snapshot.content_rules.retain(|key, _| {
+            let key = content_key(key);
+            key != normalized && !key.starts_with(&prefix)
+        });
+        self.snapshot.content_rules.insert(normalized, included);
+    }
+
+    #[cfg(test)]
+    fn content_state(&self, path: &str) -> gpui_kit::base::CheckboxState {
+        use gpui_kit::base::CheckboxState;
+        let prefix = format!("{}/", content_key(path));
+        let mut included = content_included(path, &self.snapshot.content_rules);
+        let mut excluded = !included;
+        for entry in &self.snapshot.content_entries {
+            if content_key(&entry.path).starts_with(&prefix) {
+                let selected = content_included(&entry.path, &self.snapshot.content_rules);
+                included |= selected;
+                excluded |= !selected;
+            }
+        }
+        match (included, excluded) {
+            (true, true) => CheckboxState::Indeterminate,
+            (true, false) => CheckboxState::Checked,
+            _ => CheckboxState::Unchecked,
+        }
+    }
+
+    fn render_contents(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui_kit::base::{Checkbox as TreeCheckbox, CheckboxState};
+        // Group metadata once. Normalized ancestors let collapsed inventories
+        // render in O(entries × path depth), rather than scanning every row for
+        // every visible path. Portable aliases share one control.
+        let mut groups: BTreeMap<String, Vec<&ContentEntry>> = BTreeMap::new();
+        let mut states: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+        let mut directories = BTreeSet::new();
+        for entry in &self.snapshot.content_entries {
+            let key = content_key(&entry.path);
+            groups.entry(key.clone()).or_default().push(entry);
+            if entry.kind == "directory" {
+                directories.insert(key.clone());
+            }
+        }
+        let rules: BTreeMap<_, _> = self
+            .snapshot
+            .content_rules
+            .iter()
+            .map(|(path, included)| (content_key(path), *included))
+            .collect();
+        for key in groups.keys() {
+            let mut rule_path = Some(key.as_str());
+            let mut included = true;
+            while let Some(path) = rule_path {
+                if let Some(value) = rules.get(path) {
+                    included = *value;
+                    break;
+                }
+                rule_path = path.rsplit_once('/').map(|(parent, _)| parent);
+            }
+            let mut ancestor = Some(key.as_str());
+            while let Some(path) = ancestor {
+                let state = states.entry(path.to_owned()).or_default();
+                state.0 |= included;
+                state.1 |= !included;
+                ancestor = path.rsplit_once('/').map(|(parent, _)| parent);
+            }
+        }
+        let visible: Vec<_> = groups
+            .iter()
+            .filter(|(key, _)| {
+                let mut ancestor = key.rsplit_once('/').map(|(parent, _)| parent);
+                while let Some(path) = ancestor {
+                    if directories.contains(path) && !self.contents_expanded.contains(path) {
+                        return false;
+                    }
+                    ancestor = path.rsplit_once('/').map(|(parent, _)| parent);
+                }
+                true
+            })
+            .collect();
+        let directory_bytes = listed_directory_bytes(&self.snapshot.content_entries);
+        let ready = self.snapshot.contents_loaded && self.snapshot.contents_source_ready;
+        div().id("choose-contents").test_support().flex().flex_col().size_full().min_w_0()
+            .child(div().px_5().py_4().border_b_1().border_color(cx.theme().border)
+                .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Choose contents"))
+                .child(div().mt_1().text_sm().child("Choose files and folders before reviewing differences. Paths are relative to each device’s Pi directory."))
+                .child(div().mt_2().text_xs().text_color(cx.theme().muted_foreground)
+                    .child("Limits: 4 MiB per file · 8 MiB total custom files. Including an oversized log still fails review. Target-only files are never deleted."))
+                .child(div().mt_3().flex().items_center().gap_3()
+                    .child(Button::new("exclude-suggested").label("Exclude suggested logs & caches")
+                        .disabled(self.is_busy() || !self.snapshot.content_entries.iter().any(|entry| entry.suggested))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let paths: BTreeSet<_> = this.snapshot.content_entries.iter().filter(|entry| entry.suggested).map(|entry| entry.path.clone()).collect();
+                            for path in paths { this.set_content_rule(&path, false); }
+                            this.save_content_rules(cx);
+                        })))
+                    .child(div().flex_1().text_xs().text_color(cx.theme().muted_foreground).child("Suggestions are optional. Saved choices stay unchanged until you edit them."))))
+            .child(div().id("contents-scroll").flex_1().min_h_0().overflow_y_scroll().px_5().py_3()
+                .children(self.snapshot.contents_errors.iter().map(|(device, issue)| div().py_2().text_color(cx.theme().danger).child(format!("{device}: {issue}"))))
+                .when(!self.snapshot.contents_errors.is_empty() && self.snapshot.contents_source_ready, |el| el.child(div().py_2().text_sm().child("Review will recheck targets and block any unavailable device; other targets can proceed. Go back to deselect a device.")))
+                .when(self.snapshot.content_entries.is_empty(), |el| el.child(div().py_5().child(if self.is_busy() { "Reading contents…" } else { "No inventory available. Refresh contents to try again." })))
+                .children(visible.iter().map(|(key, entries)| {
+                    let path = entries[0].path.clone();
+                    let toggle_path = path.clone();
+                    let expand_path = content_key(&path);
+                    let directory = directories.contains(&expand_path);
+                    let expanded = self.contents_expanded.contains(&expand_path);
+                    let state = match states.get(*key) {
+                        Some((true, true)) => CheckboxState::Indeterminate,
+                        Some((true, false)) => CheckboxState::Checked,
+                        _ => CheckboxState::Unchecked,
+                    };
+                    let mut depth = 0;
+                    let mut ancestor = key.rsplit_once('/').map(|(parent, _)| parent);
+                    while let Some(parent) = ancestor {
+                        depth += usize::from(directories.contains(parent));
+                        ancestor = parent.rsplit_once('/').map(|(parent, _)| parent);
+                    }
+                    let toggle = cx.listener(move |this, state: &CheckboxState, _, cx| {
+                        this.set_content_rule(&toggle_path, *state == CheckboxState::Checked);
+                        this.save_content_rules(cx);
+                    });
+                    let marker = match state { CheckboxState::Checked => "✓", CheckboxState::Unchecked => "", CheckboxState::Indeterminate => "−" };
+                    div().py_2().border_b_1().border_color(cx.theme().border).pl(px((depth * 20) as f32))
+                        .child(div().flex().items_center().gap_2()
+                            .child(Button::new(SharedString::from(format!("expand-content-{path}"))).ghost().small()
+                                .label(if directory { if expanded { "▾" } else { "▸" } } else { "·" })
+                                .accessibility_label(format!("{} {path}", if expanded { "Collapse" } else { "Expand" }))
+                                .disabled(!directory)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if !this.contents_expanded.remove(&expand_path) { this.contents_expanded.insert(expand_path.clone()); }
+                                    cx.notify();
+                                })))
+                            .child(TreeCheckbox::new(SharedString::from(format!("content-{path}")))
+                                .state(state).disabled(self.is_busy())
+                                .accessibility_label(format!("Include {path}"))
+                                .flex().items_center().gap_2()
+                                .child(div().w_4().h_4().border_1().border_color(cx.theme().border).rounded_sm().flex().items_center().justify_center().child(marker))
+                                .child(path.clone())
+                                .on_change(move |state, _, window, cx| toggle(&state, window, cx)))
+                            .when(entries.iter().any(|entry| entry.suggested), |el| el.child(div().text_xs().text_color(cx.theme().muted_foreground).child("Suggested exclusion")))
+                            .when(state == CheckboxState::Indeterminate, |el| el.child(div().text_xs().child("Partly included")))
+                            .when(state == CheckboxState::Unchecked, |el| el.child(div().text_xs().text_color(cx.theme().muted_foreground).child("Excluded"))))
+                        .children(entries.iter().map(|entry| {
+                            let size = content_size_label(entry, &directory_bytes);
+                            div().pl_10().pt_1().text_xs().text_color(if entry.issue.is_some() { cx.theme().danger } else { cx.theme().muted_foreground })
+                                .child(format!("{} · {} · {} · {}{}", entry.device, entry.path, entry.kind, size, entry.issue.as_ref().map(|issue| format!(" · {issue}")).unwrap_or_default()))
+                        }))
+                })))
+            .child(div().px_5().py_3().border_t_1().border_color(cx.theme().border).flex().items_center().gap_3()
+                .child(div().flex_1().text_xs().child(if ready { "Choices are remembered. Nothing has been copied." } else { "Exclude a blocked branch, then refresh. Re-included folders also need a refresh." }))
+                .child(Button::new("back-from-contents").label("Back to selection").disabled(self.is_busy())
+                    .on_click(cx.listener(|this, _, _, cx| { this.contents_open = false; cx.notify(); })))
+                .child(Button::new("refresh-contents").label("Refresh contents").disabled(self.is_busy())
+                    .on_click(cx.listener(|this, _, _, cx| this.load_contents(cx))))
+                .child(Button::new("continue-contents").primary().label("Continue to review →").disabled(self.is_busy() || !ready)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.snapshot.contents_loaded && this.snapshot.contents_source_ready && !this.is_busy() { this.prepare_diff(cx); }
+                    }))))
     }
 
     fn unresolved(&self) -> usize {
@@ -2110,6 +2432,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &RefreshDevices, _, cx| {
                 if this.busy.is_none() {
                     this.invalidate_review();
+                    this.contents_open = false;
+                    this.snapshot.contents_loaded = false;
                     this.send(Command::Refresh, "Refreshing devices", cx);
                 }
             }))
@@ -2145,6 +2469,8 @@ impl Render for Workspace {
                     .min_h_0()
                     .child(if self.snapshot.plan_id.is_some() {
                         self.render_review(window, cx).into_any_element()
+                    } else if self.contents_open {
+                        self.render_contents(cx).into_any_element()
                     } else if self.onboarding {
                         self.render_onboarding(cx).into_any_element()
                     } else {

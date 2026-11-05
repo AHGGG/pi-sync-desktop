@@ -2619,3 +2619,418 @@ fn failed_full_file_read_restores_review_keyboard(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+fn acknowledge_content_rules(
+    view: &Entity<Workspace>,
+    window: &mut gpui_kit::Window,
+    cx: &mut gpui_kit::App,
+) {
+    view.update(cx, |view, cx| {
+        view.receive(
+            crate::ui_model::Event::ContentRulesSaved {
+                content_rules: view.snapshot.content_rules.clone(),
+                has_last_selection: true,
+            },
+            window,
+            cx,
+        );
+    });
+}
+
+fn contents_fixture(view: &mut Workspace) {
+    use crate::ui_model::ContentEntry;
+    view.selected = ["path:extensions".into()].into();
+    view.targets = ["target".into()].into();
+    view.snapshot.selected_item_ids = vec!["path:extensions".into()];
+    view.snapshot.target_ids = vec!["target".into()];
+    view.snapshot.contents_loaded = true;
+    view.snapshot.contents_source_ready = true;
+    view.snapshot.content_entries = vec![
+        ContentEntry {
+            path: "extensions".into(),
+            kind: "directory".into(),
+            device: "Source".into(),
+            bytes: None,
+            issue: None,
+            suggested: false,
+            omitted: false,
+        },
+        ContentEntry {
+            path: "extensions/settings.json".into(),
+            kind: "file".into(),
+            device: "Source".into(),
+            bytes: Some(80),
+            issue: None,
+            suggested: false,
+            omitted: false,
+        },
+        ContentEntry {
+            path: "extensions/settings.json".into(),
+            kind: "file".into(),
+            device: "Target".into(),
+            bytes: Some(90),
+            issue: None,
+            suggested: false,
+            omitted: false,
+        },
+        ContentEntry {
+            path: "extensions/debug.log".into(),
+            kind: "file".into(),
+            device: "Source".into(),
+            bytes: Some(6 * 1024 * 1024),
+            issue: Some("Exceeds 4 MiB per-file limit".into()),
+            suggested: true,
+            omitted: false,
+        },
+    ];
+    view.contents_expanded.insert("extensions".into());
+    view.contents_open = true;
+}
+
+#[gpui_kit::test]
+fn custom_review_first_inventories_and_requires_continue(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, false);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.selected.insert("path:extensions".into());
+            view.targets.insert("target".into());
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.click("prepare-review", cx);
+        assert!(matches!(
+            next_action(&received),
+            Some(Command::LoadContents { .. })
+        ));
+        window.render_frame(cx);
+        assert_eq!(window.find("continue-contents").disabled(), Some(true));
+        view.update(cx, |view, cx| {
+            contents_fixture(view);
+            let snapshot = view.snapshot.clone();
+            view.receive(crate::ui_model::Event::ContentsLoaded(snapshot), window, cx);
+        });
+        window.render_frame(cx);
+        assert!(window.find_all("apply-reviewed").is_empty());
+        assert_ne!(window.find("continue-contents").disabled(), Some(true));
+        assert!(
+            view.read(cx).snapshot.content_rules.is_empty(),
+            "suggestions must not silently change choices"
+        );
+        window.click("exclude-suggested", cx);
+        acknowledge_content_rules(&view, window, cx);
+        assert!(matches!(
+            next_action(&received),
+            Some(Command::SaveContentRules { .. })
+        ));
+        assert_eq!(
+            view.read(cx)
+                .snapshot
+                .content_rules
+                .get("extensions/debug.log"),
+            Some(&false)
+        );
+        assert_eq!(
+            view.read(cx).content_state("extensions"),
+            gpui_kit::base::CheckboxState::Indeterminate
+        );
+        window.click("continue-contents", cx);
+        assert!(matches!(
+            next_action(&received),
+            Some(Command::Prepare { .. })
+        ));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn contents_tree_expand_toggle_nested_include_and_back_preserve_rules(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, false);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| { contents_fixture(view); cx.notify(); });
+        window.render_frame(cx);
+        window.click("expand-content-extensions", cx);
+        window.render_frame(cx);
+        assert!(window.find_all("content-extensions/debug.log").is_empty());
+        window.click("expand-content-extensions", cx);
+        window.render_frame(cx);
+        window.click("content-extensions", cx);
+        acknowledge_content_rules(&view, window, cx);
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).content_state("extensions"), gpui_kit::base::CheckboxState::Unchecked);
+        window.click("content-extensions/settings.json", cx);
+        acknowledge_content_rules(&view, window, cx);
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).content_state("extensions"), gpui_kit::base::CheckboxState::Indeterminate);
+        assert!(!crate::ui_model::content_included("extensions/debug.log", &view.read(cx).snapshot.content_rules));
+        assert!(crate::ui_model::content_included("extensions/settings.json", &view.read(cx).snapshot.content_rules));
+        window.click("back-from-contents", cx);
+        window.render_frame(cx);
+        assert!(!view.read(cx).contents_open);
+        assert_eq!(view.read(cx).snapshot.content_rules.len(), 2);
+        while received.try_recv().is_ok() {}
+        window.click("prepare-review", cx);
+        assert!(matches!(next_action(&received), Some(Command::LoadContents { content_rules, .. }) if content_rules.len() == 2));
+    }).unwrap();
+}
+
+#[gpui_kit::test]
+fn inventory_failure_cannot_continue_or_accept_stale_result(cx: &mut TestAppContext) {
+    let (handle, view, _) = window(cx, false);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            contents_fixture(view);
+            view.snapshot
+                .content_rules
+                .insert("extensions/debug.log".into(), false);
+            view.busy = Some("Refreshing".into());
+            view.receive(
+                crate::ui_model::Event::Error("Cancelled inventory".into()),
+                window,
+                cx,
+            );
+            let mut stale = view.snapshot.clone();
+            stale.contents_loaded = true;
+            view.receive(crate::ui_model::Event::ContentsLoaded(stale), window, cx);
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("continue-contents").disabled(), Some(true));
+        assert_eq!(
+            view.read(cx)
+                .snapshot
+                .content_rules
+                .get("extensions/debug.log"),
+            Some(&false)
+        );
+        window.click("back-from-contents", cx);
+        window.render_frame(cx);
+        assert!(!view.read(cx).contents_open);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn target_inventory_failure_allows_review_but_changed_selection_requires_refresh(
+    cx: &mut TestAppContext,
+) {
+    let (handle, view, _) = window(cx, false);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            contents_fixture(view);
+            view.snapshot
+                .contents_errors
+                .push(("Target".into(), "SSH unavailable".into()));
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert_ne!(window.find("continue-contents").disabled(), Some(true));
+        window.click("back-from-contents", cx);
+        window.render_frame(cx);
+        window.click("target-target", cx);
+        assert!(!view.read(cx).snapshot.contents_loaded);
+        assert!(view.read(cx).snapshot.content_entries.is_empty());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn contents_portable_aliases_share_control_and_branch_rules(cx: &mut TestAppContext) {
+    let (handle, view, _received) = window(cx, false);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            contents_fixture(view);
+            let mut alias = view.snapshot.content_entries[3].clone();
+            alias.path = "Extensions/DEBUG.log".into();
+            alias.device = "Target".into();
+            view.snapshot.content_entries.push(alias);
+            view.snapshot
+                .content_rules
+                .insert("ＥＸＴＥＮＳＩＯＮＳ/debug.log".into(), false);
+            view.set_content_rule("Extensions", true);
+            assert_eq!(view.snapshot.content_rules.len(), 1);
+            assert_eq!(view.snapshot.content_rules.get("extensions"), Some(&true));
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find_all("content-extensions/debug.log").len(), 1);
+        assert!(window.find_all("content-Extensions/DEBUG.log").is_empty());
+        window.click("content-extensions/debug.log", cx);
+        acknowledge_content_rules(&view, window, cx);
+        assert_eq!(
+            view.read(cx).content_state("extensions"),
+            gpui_kit::base::CheckboxState::Indeterminate
+        );
+        assert_eq!(
+            view.read(cx)
+                .snapshot
+                .content_rules
+                .get("extensions/debug.log"),
+            Some(&false)
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn partial_inventory_can_exclude_failed_branch_then_refresh(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, false);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            contents_fixture(view);
+            view.snapshot.contents_loaded = true;
+            view.snapshot.contents_source_ready = false;
+            view.snapshot.contents_errors.push(("Source".into(), "Cache scan exceeded inventory limit".into()));
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("continue-contents").disabled(), Some(true));
+        assert_ne!(window.find("exclude-suggested").disabled(), Some(true));
+        window.click("exclude-suggested", cx);
+        acknowledge_content_rules(&view, window, cx);
+        assert_eq!(view.read(cx).snapshot.content_rules.get("extensions/debug.log"), Some(&false));
+        window.click("content-extensions", cx);
+        acknowledge_content_rules(&view, window, cx);
+        assert_eq!(view.read(cx).snapshot.content_rules.get("extensions"), Some(&true)); // mixed -> include, still needs metadata
+        window.click("content-extensions", cx);
+        acknowledge_content_rules(&view, window, cx);
+        assert_eq!(view.read(cx).snapshot.content_rules.get("extensions"), Some(&false));
+        while received.try_recv().is_ok() {}
+        window.click("refresh-contents", cx);
+        assert!(matches!(next_action(&received), Some(Command::LoadContents { content_rules, .. }) if content_rules.get("extensions") == Some(&false)));
+        assert!(view.read(cx).snapshot.content_entries.is_empty());
+    }).unwrap();
+}
+
+#[gpui_kit::test]
+fn contents_save_ack_is_required_and_failure_blocks_review(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, false);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            contents_fixture(view);
+            cx.notify();
+        });
+        window.render_frame(cx);
+        window.click("exclude-suggested", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("continue-contents").disabled(), Some(true));
+        assert!(matches!(
+            next_action(&received),
+            Some(Command::SaveContentRules { .. })
+        ));
+        view.update(cx, |view, cx| {
+            view.receive(
+                crate::ui_model::Event::SelectionSaved {
+                    has_last_selection: true,
+                },
+                window,
+                cx,
+            );
+            view.receive(
+                crate::ui_model::Event::ContentRulesSaved {
+                    content_rules: Default::default(),
+                    has_last_selection: true,
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("continue-contents").disabled(), Some(true));
+        window.click("continue-contents", cx);
+        assert!(received.try_recv().is_err());
+        view.update(cx, |view, cx| {
+            view.receive(
+                crate::ui_model::Event::Error("Could not save choices".into()),
+                window,
+                cx,
+            )
+        });
+        acknowledge_content_rules(&view, window, cx); // late success must not revive readiness
+        window.render_frame(cx);
+        assert_eq!(window.find("continue-contents").disabled(), Some(true));
+        assert!(!view.read(cx).snapshot.contents_loaded);
+        assert_eq!(
+            view.read(cx)
+                .snapshot
+                .content_rules
+                .get("extensions/debug.log"),
+            Some(&false)
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn loaded_inventory_expands_selected_roots_not_every_nested_directory(cx: &mut TestAppContext) {
+    let (handle, view, _received) = window(cx, false);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            contents_fixture(view);
+            let mut folder = view.snapshot.content_entries[0].clone();
+            folder.path = "extensions/nested".into();
+            view.snapshot.content_entries.push(folder);
+            let mut file = view.snapshot.content_entries[1].clone();
+            file.path = "extensions/nested/deeper.json".into();
+            view.snapshot.content_entries.push(file);
+            view.busy = Some("Reading metadata".into());
+            view.receive(
+                crate::ui_model::Event::ContentsLoaded(view.snapshot.clone()),
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        assert!(!window.find_all("content-extensions/nested").is_empty());
+        assert!(
+            window
+                .find_all("content-extensions/nested/deeper.json")
+                .is_empty()
+        );
+        window.click("expand-content-extensions/nested", cx);
+        window.render_frame(cx);
+        assert!(
+            !window
+                .find_all("content-extensions/nested/deeper.json")
+                .is_empty()
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn folder_sizes_are_per_device_listed_totals_and_omitted_is_not_zero(cx: &mut TestAppContext) {
+    let (handle, view, _received) = window(cx, false);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            contents_fixture(view);
+            let mut target = view.snapshot.content_entries[0].clone();
+            target.device = "Target".into();
+            view.snapshot.content_entries.push(target);
+            let totals = super::listed_directory_bytes(&view.snapshot.content_entries);
+            assert_eq!(
+                totals.get(&("Source".into(), "extensions".into())),
+                Some(&(6 * 1024 * 1024 + 80))
+            );
+            assert_eq!(
+                totals.get(&("Target".into(), "extensions".into())),
+                Some(&90)
+            );
+            let directory = &view.snapshot.content_entries[0];
+            assert_eq!(
+                super::content_size_label(directory, &totals),
+                "6.00 MiB listed total (may be partial)"
+            );
+            let mut omitted = directory.clone();
+            omitted.path = "extensions/cache".into();
+            omitted.omitted = true;
+            assert_eq!(
+                super::content_size_label(&omitted, &totals),
+                "Excluded branch; include and refresh to list sizes"
+            );
+            view.snapshot.content_entries.push(omitted);
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert!(!window.find_all("content-extensions/cache").is_empty());
+    })
+    .unwrap();
+}

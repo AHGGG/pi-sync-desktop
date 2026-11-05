@@ -1,5 +1,13 @@
 # Verification record
 
+## Folder content choices · 2026-11-05
+
+- Added a native pre-review Choose contents tree with nested tri-state choices, source/target names and file sizes, clearly qualified directory totals, optional logs/cache suggestions, and persisted choices. Legacy selections gain no automatic exclusions. Saving must acknowledge the exact rules before review can continue; failed saves retain editable choices. Incomplete source metadata supports exclude-and-refresh recovery; unavailable targets remain independently blocked during review.
+- All 188 Node backend tests and 107 desktop tests passed locally, plus 26 core tests and the fixture diagnostic. Regressions cover excluded oversized logs on both devices, nested re-inclusion, excluded churn versus included stale changes, bounded inventory, protected paths, portable aliases, injection, apply/backup guards, deterministic enumeration, persistence and old-file migration, partial listings, error/save acknowledgments, and native controls. Independent adversarial review also exercised the standalone remote-worker protocol without real devices.
+- Formatting, workspace/all-targets/all-features warnings-denied Clippy, diff whitespace checks, and the public credential-pattern scan passed. Synthetic Choose contents and preserved full-file GPUI/WGPU renders were visually inspected. No live user configuration, credentials or devices were accessed or changed.
+- The native askpass helper-process integration passed. The full isolated SSH fixture failed locally when its disposable ssh-agent process exited; the explicitly agent-skipped run then passed. This is incomplete local agent coverage, not a full integration pass. The published commit's CI must separately pass the mandatory Linux agent fixture and native Linux/macOS/Windows jobs.
+- Limits remain 4 MiB per included file, 8 MiB aggregate included custom bytes, and 256 included files per device. Selecting an oversized log still fails with an actionable path/device/size/limit error. Native offscreen Linux tests do not establish Windows/macOS manual window behavior, accessibility, or live-user SSH interoperability.
+
 ## Platform-specific picker buttons · 2026-11-05
 
 - macOS now uses one combined files-and-folders button when the native picker supports it. Windows and Linux keep the two separate buttons. Multiple selection, cancellation, root validation and remembered scope share the same existing path.
