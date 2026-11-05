@@ -1,5 +1,18 @@
 # Verification record
 
+## Platform-specific picker buttons · 2026-11-05
+
+- macOS now uses one combined files-and-folders button when the native picker supports it. Windows and Linux keep the two separate buttons. Multiple selection, cancellation, root validation and remembered scope share the same existing path.
+- All 89 desktop tests and 25 core tests passed, including platform/capability layout checks, mixed file/folder selection, combined-picker Cancel, and existing separate-picker protections. Workspace/all-targets/all-features warnings-denied Clippy, formatting and diff checks passed. The Node worker is unchanged from the 159-test pass below.
+- Both button layouts were rendered with GPUI/WGPU and inspected. The combined-layout fixture simulates the app popup; actual AppKit and Windows system dialogs remain untested here.
+
+## Native file picker and standard Pi folders · 2026-11-05
+
+- `cargo test --locked --workspace`: 86 desktop tests and 25 core tests passed locally on Linux, plus the fixture diagnostic. New picker tests exercise the real production controls with simulated platform responses: multiple selection, Cancel/empty response, repeat opening, root copy, changed source, validation failures, worker acknowledgement and saved opt-outs. Backend tests cover containment, traversal, symlink/reparse guards, protected/reserved names, regular files, batch atomicity, audited built-in mapping, persistence, and discovery of only extensions/skills/prompts/themes.
+- All 159 Node backend tests, workspace/all-targets/all-features Clippy with warnings denied, formatting, diff whitespace checks, and the public-source scan passed. One initial workspace run hit the existing fragmented-askpass 250 ms Broken pipe timing failure; the unchanged full-workspace rerun passed. No SSH transport code was changed.
+- Integrated on master `a7bbbc16a476d1fb7c10f702af31aefc895e25a9`, retaining its full-file review. The combined suite passed after conflict resolution. Native GPUI/WGPU captures of `--fixture-picker`, `--fixture-selection`, and the preserved `--fixture-full-file` flow were visually inspected. They use synthetic display data, not a live connection or sync. The picker capture is the app popup, not an OS file chooser.
+- Platform picker responses are simulated in tests. Actual Windows/macOS system dialogs and Linux desktop-portal behavior have not been exercised here. Recursive folder-content and case/Unicode collision validation remains in the existing worker before review/apply writes. Opt-in real SSH/helper-process checks were not part of this UI run.
+
 ## Complete changed-file review · 2026-11-05
 
 - Added explicit local full-file inspection for models, custom files, settings, MCP and subagents. The view is read-only; structured JSON includes the target-only values preserved by the actual merge, and labels undecided fields as provisional. Text and hexadecimal pages are complete, with no silent truncation. Opening, paging and closing the reader do not choose versions or apply changes.

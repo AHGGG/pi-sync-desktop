@@ -28,6 +28,11 @@ fn main() -> anyhow::Result<()> {
         )
     });
     let fixture_full_file = std::env::args().any(|arg| arg == "--fixture-full-file");
+    let fixture_picker_macos = std::env::args().any(|arg| arg == "--fixture-picker-macos");
+    let fixture_picker =
+        fixture_picker_macos || std::env::args().any(|arg| arg == "--fixture-picker");
+    let fixture_selection =
+        fixture_picker || std::env::args().any(|arg| arg == "--fixture-selection");
     let fixture_next_file = std::env::args().any(|arg| arg == "--fixture-next-file");
     let fixture_navigation = fixture_next_file
         || fixture_overlay.is_some()
@@ -35,7 +40,7 @@ fn main() -> anyhow::Result<()> {
     let fixture_review = fixture_full_file
         || fixture_navigation
         || std::env::args().any(|arg| arg == "--fixture-review");
-    if fixture_review {
+    if fixture_review || fixture_selection {
         let ui_model::Event::Snapshot(snapshot) = &mut initial else {
             anyhow::bail!("Missing startup snapshot");
         };
@@ -54,6 +59,22 @@ fn main() -> anyhow::Result<()> {
             ui_model::Change { id: "example:settings:/theme".into(), device: "Example workstation (fixture)".into(), path: "settings.json/theme".into(), before: "dark".into(), after: "light".into(), conflict: true, source_available: true },
             ui_model::Change { id: "example:files:extensions/example.ts".into(), device: "Example workstation (fixture)".into(), path: "extensions/example.ts · entire file".into(), before: "No previous file".into(), after: "export const greeting = \"Hello\";\n\nWhole-file copy. Extension code may execute in Pi.\nSynthetic documentation fixture, not user configuration.".into(), conflict: true, source_available: true },
         ];
+    }
+    if fixture_selection {
+        let ui_model::Event::Snapshot(snapshot) = &mut initial else {
+            unreachable!()
+        };
+        snapshot.source_id = Some("local".into());
+        snapshot
+            .devices
+            .iter_mut()
+            .find(|device| device.id == "local")
+            .unwrap()
+            .address = "/home/example/.pi/agent".into();
+        snapshot.selected_item_ids = vec!["path:extensions".into(), "path:skills".into()];
+        snapshot.plan_id = None;
+        snapshot.changes.clear();
+        snapshot.has_last_selection = true;
     }
     if fixture_navigation {
         let ui_model::Event::Snapshot(snapshot) = &mut initial else {
@@ -100,9 +121,12 @@ fn main() -> anyhow::Result<()> {
     );
     context.update(|cx| {
         gpui_kit::init(cx);
+        if fixture_picker {
+            cx.set_reduce_motion(true);
+        }
         Theme::change(ThemeMode::Light, None, cx);
     });
-    let (handle, _) = context.update(|cx| {
+    let (handle, view) = context.update(|cx| {
         gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::new(
@@ -147,6 +171,33 @@ fn main() -> anyhow::Result<()> {
     context.run_until_parked();
     context.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
+        if fixture_picker {
+            if fixture_picker_macos {
+                view.update(cx, |view, cx| {
+                    view.show_local_path_picker_with_mixed(true, window, cx)
+                });
+                window.render_frame(cx);
+            } else {
+                window.click("add-path", cx);
+            }
+            let mixed = fixture_picker_macos
+                || (cfg!(target_os = "macos") && cx.can_select_mixed_files_and_dirs());
+            assert_eq!(
+                window.within("dialog").find_all("choose-local-items").len(),
+                usize::from(mixed)
+            );
+            assert_eq!(
+                window.within("dialog").find_all("choose-local-files").len(),
+                usize::from(!mixed)
+            );
+            assert_eq!(
+                window
+                    .within("dialog")
+                    .find_all("choose-local-folders")
+                    .len(),
+                usize::from(!mixed)
+            );
+        }
         if fixture_navigation {
             window.click("review-item-example:files:extensions/example.ts", cx);
             if let Some(state) = &fixture_overlay {

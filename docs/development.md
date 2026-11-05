@@ -36,6 +36,14 @@ New `ssh alias` profiles inherit omitted user/port values from OpenSSH config. E
 
 CI defines Linux, macOS and Windows native build/test jobs, with mandatory real SSH and isolated-agent integration on Linux. A matrix definition is not evidence of a passing platform build. Check the exact commit's job results. Native window/input, scaling, keyboard, accessibility, live SSH and installer behavior require separate smoke tests.
 
+## File picker validation
+
+The local Add file or folder popup shows one combined button on macOS when GPUI confirms mixed file/folder selection support. Windows and Linux retain separate file and folder buttons because their native picker modes are mutually exclusive. Every mode enables multiple selection. The pinned GPUI API has no starting-directory option, so the popup displays the configured Pi directory and provides Copy path. SSH sources do not use the local system picker.
+
+Production-view tests simulate the platform picker response and cover multiple paths, Cancel, empty results, repeated opening, changed sources, worker validation errors, and persisted scope acknowledgements. Backend tests check containment after canonicalization, symlink/reparse rejection, protected and nonportable names, atomic batch rejection, existing selections, and standard-folder discovery. Recursive content and case/Unicode-collision checks remain in the worker's existing review/apply boundary.
+
+For native rendered fixtures, build `cargo build --locked -p pi-sync-desktop --features render-check --bin pi-sync-render-check`, then run `pi-sync-render-check output.png --fixture-picker` , `--fixture-picker-macos`, or `--fixture-selection`. The macOS fixture exercises the combined app layout without claiming actual AppKit execution. These use synthetic display data and never perform a sync. The picker fixture captures the app popup, not an OS chooser. Actual platform dialogs, particularly macOS/Windows and Linux desktop-portal availability, still require real-window testing.
+
 ## Distribution
 
 The supported development entry point is Cargo. No npm package or installer is published. Prefer signed native releases first. A future `npx` wrapper can map OS/architecture to a pinned signed release and verified checksum, then spawn the binary without a browser engine. Avoid an installer that downloads and runs an unversioned `latest` executable.

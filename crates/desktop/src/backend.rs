@@ -23,6 +23,12 @@ use zeroize::Zeroizing;
 
 const WORKER: &str = include_str!("../../../backend/worker.mjs");
 const PUBLIC_ID: &str = "public-harness";
+const PI_RESOURCE_FOLDERS: &[(&str, &str)] = &[
+    ("extensions", "Extensions"),
+    ("skills", "Skills"),
+    ("prompts", "Prompt templates"),
+    ("themes", "Themes"),
+];
 // Combined audited documents, models, and custom files share this private protocol envelope.
 const MAX_PROTOCOL_BYTES: usize = 48 * 1024 * 1024;
 #[derive(Clone, Serialize, Deserialize)]
@@ -230,6 +236,9 @@ pub(crate) fn start() -> (Sender<Command>, Receiver<Event>) {
 }
 impl Backend {
     fn publish(&mut self) {
+        self.publish_with(false);
+    }
+    fn publish_with(&mut self, local_paths_added: bool) {
         self.snapshot.devices = vec![
             Device {
                 id: PUBLIC_ID.into(),
@@ -242,7 +251,10 @@ impl Backend {
             Device {
                 id: "local".into(),
                 name: "This computer".into(),
-                address: local_root(),
+                address: directories::BaseDirs::new()
+                    .and_then(|base| expand_local_root(&local_root(), base.home_dir()).ok())
+                    .map(|root| root.to_string_lossy().into_owned())
+                    .unwrap_or_else(local_root),
                 status: "Local".into(),
                 is_local: true,
                 platform: std::env::consts::OS.into(),
@@ -273,7 +285,30 @@ impl Backend {
         if self.snapshot.source_id.as_deref() != Some(PUBLIC_ID) {
             self.snapshot.items.push(ConfigItem { id: "models".into(), name: "Private model definitions".into(), category: "Private · device to device".into(), detail: "Copy the entire models.json file. Private values stay hidden; the previous file is backed up.".into() });
         }
+        if self.snapshot.source_id.as_deref() != Some(PUBLIC_ID) {
+            for (path, name) in PI_RESOURCE_FOLDERS {
+                self.snapshot.items.push(ConfigItem {
+                    id: format!("path:{path}"),
+                    name: (*name).into(),
+                    category: "Pi resources".into(),
+                    detail: match *path {
+                        "extensions" => "extensions/ · Code may execute in Pi.",
+                        "skills" => "skills/ · Reusable skills and instructions.",
+                        "prompts" => "prompts/ · Prompt templates.",
+                        "themes" => "themes/ · Color themes.",
+                        _ => unreachable!("known resource folder"),
+                    }
+                    .into(),
+                });
+            }
+        }
         for id in &self.snapshot.selected_item_ids {
+            if PI_RESOURCE_FOLDERS
+                .iter()
+                .any(|(path, _)| id == &format!("path:{path}"))
+            {
+                continue;
+            }
             if let Some(path) = id.strip_prefix("path:") {
                 self.snapshot.items.push(ConfigItem {
                     id: id.clone(), name: path.into(), category: "Files & folders".into(),
@@ -285,7 +320,12 @@ impl Backend {
             .last
             .as_ref()
             .is_some_and(|selection| !selection.items.is_empty() && !selection.targets.is_empty());
-        let _ = self.events.send(Event::Snapshot(self.snapshot.clone()));
+        let event = if local_paths_added {
+            Event::LocalPathsAdded(self.snapshot.clone())
+        } else {
+            Event::Snapshot(self.snapshot.clone())
+        };
+        let _ = self.events.send(event);
     }
     fn invalidate(&mut self) {
         self.plan = None;
@@ -318,6 +358,15 @@ impl Backend {
                 self.invalidate();
                 self.snapshot.blocked_targets.clear();
                 self.publish();
+            }
+            Command::AddLocalPaths {
+                paths,
+                targets,
+                items,
+            } => {
+                let home = directories::BaseDirs::new().context("Cannot locate home directory")?;
+                let root = expand_local_root(&local_root(), home.home_dir())?;
+                self.add_local_paths(&root, paths, targets, items)?;
             }
             Command::AddDevice {
                 name,
@@ -391,6 +440,12 @@ impl Backend {
             }
             Command::SelectSource(id) => {
                 self.source(&id)?;
+                if self.snapshot.source_id.as_deref() == Some(id.as_str()) {
+                    // Clicking the current source must not restore defaults over
+                    // an explicit resource-folder opt-out or staged review.
+                    self.publish();
+                    return Ok(());
+                }
                 self.save_selection(Selection {
                     source: id.clone(),
                     targets: self
@@ -400,7 +455,13 @@ impl Backend {
                         .filter(|target| *target != &id)
                         .cloned()
                         .collect(),
-                    items: vec![],
+                    items: if id == "local" {
+                        configured_local_root()
+                            .map(|root| discover_local_resources(&root))
+                            .unwrap_or_default()
+                    } else {
+                        vec![]
+                    },
                 })?;
                 self.invalidate();
                 self.snapshot.blocked_targets.clear();
@@ -516,6 +577,29 @@ impl Backend {
         }
         Ok(())
     }
+    fn add_local_paths(
+        &mut self,
+        root: &Path,
+        paths: Vec<PathBuf>,
+        targets: Vec<String>,
+        items: Vec<String>,
+    ) -> Result<()> {
+        ensure!(
+            self.snapshot.source_id.as_deref() == Some("local"),
+            "Choose This computer as the source before adding local files"
+        );
+        // Validate the entire batch before changing disk, selection, or review state.
+        let items = selected_local_items(root, &paths, items)?;
+        self.save_selection(Selection {
+            source: "local".into(),
+            targets,
+            items,
+        })?;
+        self.invalidate();
+        self.snapshot.blocked_targets.clear();
+        self.publish_with(true);
+        Ok(())
+    }
     fn target(&self, id: &str) -> Result<Value> {
         if id == "local" {
             return Ok(json!({"id":"local","type":"local","agentDir":local_root()}));
@@ -535,7 +619,14 @@ impl Backend {
         }
     }
     fn restore_startup_selection(&mut self) {
+        self.restore_startup_selection_at(configured_local_root().ok().as_deref());
+    }
+    fn restore_startup_selection_at(&mut self, local_root: Option<&Path>) {
         self.snapshot.source_id = Some("local".into());
+        if self.last.is_none() {
+            self.snapshot.selected_item_ids =
+                local_root.map(discover_local_resources).unwrap_or_default();
+        }
         if let Some(mut saved) = self.last.clone() {
             if self.source(&saved.source).is_err() {
                 saved.source = "local".into();
@@ -598,7 +689,12 @@ impl Backend {
             .collect::<Result<Vec<_>>>()?;
         let result = self.call(
             json!({"op":"preview","source":source,"targets":targets,"items":selection.items}),
-        )?;
+        ).map_err(|error| {
+            if error.to_string() == explain("SOURCE_CUSTOM_PATH_MISSING") {
+                let paths = selection.items.iter().filter_map(|item| item.strip_prefix("path:")).collect::<Vec<_>>().join(", ");
+                anyhow::anyhow!("A selected source file or folder was not found: {paths}. Create the missing item inside this source's Pi directory or deselect it, then review again. No target files were changed.")
+            } else { error }
+        })?;
         self.save_selection(selection.clone())?;
         self.selection = Some(selection);
         self.set_plan(result)?;
@@ -1156,6 +1252,182 @@ fn file_preview(
     })
 }
 
+fn configured_local_root() -> Result<PathBuf> {
+    let home = directories::BaseDirs::new().context("Cannot locate home directory")?;
+    expand_local_root(&local_root(), home.home_dir())
+}
+
+// Discover only the explicitly known Pi resource directories, never arbitrary
+// user files, authentication state, or cache directories. No writes or recursion.
+fn discover_local_resources(root: &Path) -> Vec<String> {
+    PI_RESOURCE_FOLDERS
+        .iter()
+        .filter_map(|(path, _)| {
+            let path = root.join(path);
+            if !inspect_local_path(&path).ok()?.is_dir() {
+                return None;
+            }
+            // Match the worker's repository guard before auto-selecting a folder.
+            for ancestor in path.ancestors() {
+                let marker = ancestor.join(".git");
+                match fs::symlink_metadata(&marker) {
+                    Ok(meta)
+                        if !meta.is_dir()
+                            || fs::symlink_metadata(marker.join("HEAD")).is_ok()
+                            || fs::symlink_metadata(marker.join("config")).is_ok() =>
+                    {
+                        return None;
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return None,
+                }
+            }
+            selected_local_items(root, &[path], vec![])
+                .ok()?
+                .into_iter()
+                .next()
+        })
+        .collect()
+}
+
+/// Match the worker's supported home expansion without changing global environment.
+fn expand_local_root(root: &str, home: &Path) -> Result<PathBuf> {
+    ensure!(
+        !root.is_empty() && !root.contains('\0'),
+        "Invalid Pi directory"
+    );
+    let root = if root == "~" {
+        home.to_path_buf()
+    } else if root.starts_with("~/") || root.starts_with("~\\") {
+        let suffix = root[2..].trim_start_matches(std::path::is_separator);
+        home.join(suffix)
+    } else {
+        PathBuf::from(root)
+    };
+    ensure!(root.is_absolute(), "The Pi directory must be absolute");
+    // Reject traversal rather than resolving it through an uninspected symlink.
+    ensure!(
+        !root
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "Parent traversal is not allowed in the Pi directory"
+    );
+    ensure!(
+        root.parent().is_some(),
+        "The filesystem root cannot be the Pi directory"
+    );
+    Ok(root)
+}
+
+fn inspect_local_path(path: &Path) -> Result<fs::Metadata> {
+    ensure!(
+        path.is_absolute(),
+        "Choose an absolute path inside the Pi directory"
+    );
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        ensure!(
+            !matches!(component, std::path::Component::ParentDir),
+            "Parent traversal cannot be selected"
+        );
+        current.push(component.as_os_str());
+        // A Windows drive prefix alone (C:) is drive-relative; inspect only
+        // after the following root component makes it an absolute path.
+        if matches!(component, std::path::Component::Prefix(_)) {
+            continue;
+        }
+        let metadata =
+            fs::symlink_metadata(&current).context("The selected path could not be inspected")?;
+        ensure!(
+            !metadata.file_type().is_symlink(),
+            "Symbolic links cannot be selected"
+        );
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            ensure!(
+                metadata.file_attributes() & 0x400 == 0,
+                "Reparse points cannot be selected"
+            );
+        }
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_file() || metadata.is_dir(),
+        "Choose a regular file or folder"
+    );
+    Ok(metadata)
+}
+
+fn selected_local_items(
+    root: &Path,
+    paths: &[PathBuf],
+    mut items: Vec<String>,
+) -> Result<Vec<String>> {
+    ensure!(!paths.is_empty(), "No files or folders were selected");
+    ensure!(paths.len() <= 256, "Selection exceeds the safe size limit");
+    ensure!(
+        inspect_local_path(root)?.is_dir(),
+        "The Pi directory must be a folder"
+    );
+    ensure!(
+        root.parent().is_some(),
+        "The filesystem root cannot be the Pi directory"
+    );
+    // Canonical spelling reconciles native-picker casing / Windows extended
+    // prefixes only after raw traversal and symlink checks have passed.
+    let canonical_root = fs::canonicalize(root).context("Cannot resolve the Pi directory")?;
+    // Existing scope is authoritative, not rebuilt from the chosen directory.
+    let mut seen: HashSet<String> = items.iter().cloned().collect();
+    for path in paths {
+        let metadata = inspect_local_path(path)?;
+        let canonical_path = fs::canonicalize(path).context("Cannot resolve the selected path")?;
+        let relative = canonical_path
+            .strip_prefix(&canonical_root)
+            .context("Choose files or folders inside the configured Pi directory")?;
+        ensure!(
+            !relative.as_os_str().is_empty(),
+            "Choose an item inside the Pi directory, not the directory itself"
+        );
+        let parts = relative
+            .components()
+            .map(|component| match component {
+                std::path::Component::Normal(name) => {
+                    name.to_str().context("The file name is not valid Unicode")
+                }
+                _ => bail!("Choose a normal relative file or folder"),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let relative = parts.join("/");
+        let builtin = match relative.as_str() {
+            "settings.json" => Some("settings"),
+            "mcp.json" => Some("mcp"),
+            "subagents.json" => Some("subagents"),
+            "models.json" => Some("models"),
+            _ => None,
+        };
+        let item = if let Some(builtin) = builtin {
+            ensure!(
+                metadata.is_file(),
+                "Built-in configuration items must be regular files"
+            );
+            builtin.to_owned()
+        } else {
+            format!("path:{relative}")
+        };
+        if seen.insert(item.clone()) {
+            items.push(item);
+        }
+    }
+    validate_selection_shape(&Selection {
+        source: "local".into(),
+        targets: vec![],
+        items: items.clone(),
+    })?;
+    Ok(items)
+}
+
 fn custom_file_preview(content: &Value, hash: Option<&str>) -> String {
     let content = content.as_str().unwrap_or("Not present");
     match hash {
@@ -1420,6 +1692,367 @@ mod tests {
             operation_cancelled: false,
         }
     }
+    fn picker_tempdir() -> tempfile::TempDir {
+        // macOS temp roots may be spelled through /var, an intentional symlink.
+        let base = fs::canonicalize(std::env::temp_dir()).unwrap();
+        tempfile::tempdir_in(base).unwrap()
+    }
+
+    #[test]
+    fn native_paths_map_multiple_files_folders_and_builtins_without_duplicates() {
+        let dir = picker_tempdir();
+        let root = dir.path();
+        fs::create_dir(root.join("extensions")).unwrap();
+        let names = [
+            "permissions.json",
+            "settings.json",
+            "mcp.json",
+            "subagents.json",
+            "models.json",
+        ];
+        for name in names {
+            fs::write(root.join(name), "{}").unwrap();
+        }
+        let paths = names
+            .iter()
+            .map(|name| root.join(name))
+            .chain([root.join("extensions"), root.join("permissions.json")])
+            .collect::<Vec<_>>();
+        let items = selected_local_items(
+            root,
+            &paths,
+            vec!["settings".into(), "path:extensions".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            items,
+            vec![
+                "settings",
+                "path:extensions",
+                "path:permissions.json",
+                "mcp",
+                "subagents",
+                "models"
+            ]
+        );
+    }
+
+    #[test]
+    fn native_paths_reject_outside_root_root_traversal_bad_and_protected_names() {
+        let dir = picker_tempdir();
+        let root = dir.path().join("agent");
+        fs::create_dir(&root).unwrap();
+        fs::write(dir.path().join("outside.txt"), "x").unwrap();
+        for name in [
+            "okay.txt",
+            "auth.json",
+            "secret.txt",
+            ".hidden",
+            "settings.JSON",
+        ] {
+            fs::write(root.join(name), "x").unwrap();
+        }
+        for path in [
+            dir.path().join("outside.txt"),
+            root.clone(),
+            root.join("../agent/okay.txt"),
+            root.join("auth.json"),
+            root.join("secret.txt"),
+            root.join(".hidden"),
+            root.join("settings.JSON"),
+            PathBuf::from("okay.txt"),
+        ] {
+            assert!(
+                selected_local_items(&root, std::slice::from_ref(&path), vec![]).is_err(),
+                "accepted {path:?}"
+            );
+        }
+        assert!(
+            validate_selection_shape(&Selection {
+                source: "local".into(),
+                targets: vec![],
+                items: vec!["path:CON.txt".into()]
+            })
+            .is_err()
+        );
+        fs::create_dir(root.join("models.json")).unwrap();
+        assert!(selected_local_items(&root, &[root.join("models.json")], vec![]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_paths_reject_leaf_ancestor_and_root_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = picker_tempdir();
+        let root = dir.path().join("agent");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("real")).unwrap();
+        fs::write(root.join("real/file.txt"), "x").unwrap();
+        symlink(root.join("real/file.txt"), root.join("leaf.txt")).unwrap();
+        symlink(root.join("real"), root.join("linked")).unwrap();
+        symlink(&root, dir.path().join("alias")).unwrap();
+        for path in [root.join("leaf.txt"), root.join("linked/file.txt")] {
+            assert!(selected_local_items(&root, &[path], vec![]).is_err());
+        }
+        assert!(
+            selected_local_items(
+                &dir.path().join("alias"),
+                &[dir.path().join("alias/real/file.txt")],
+                vec![]
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_paths_reject_special_files() {
+        assert!(
+            selected_local_items(Path::new("/dev"), &[PathBuf::from("/dev/null")], vec![]).is_err()
+        );
+    }
+
+    #[test]
+    fn native_paths_publish_exact_scope_persist_restart_and_reject_batches_atomically() {
+        let dir = picker_tempdir();
+        let root = dir.path().join("agent");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("okay.txt"), "x").unwrap();
+        fs::write(root.join("auth.json"), "x").unwrap();
+        let mut backend = test_backend(dir.path());
+        backend.restore_startup_selection();
+        backend
+            .handle(Command::AddDevice {
+                name: "Target".into(),
+                ssh_line: "ssh user@host".into(),
+                root: "".into(),
+            })
+            .unwrap();
+        let targets = vec![backend.profiles[0].id.clone()];
+        let (tx, events) = mpsc::channel();
+        backend.events = tx;
+        backend.snapshot.plan_id = Some("old-plan".into());
+        backend
+            .add_local_paths(
+                &root,
+                vec![root.join("okay.txt")],
+                targets.clone(),
+                vec!["settings".into()],
+            )
+            .unwrap();
+        let Event::LocalPathsAdded(snapshot) = events.try_recv().unwrap() else {
+            panic!("expected dedicated picker event")
+        };
+        assert_eq!(
+            snapshot.selected_item_ids,
+            vec!["settings", "path:okay.txt"]
+        );
+        assert_eq!(snapshot.target_ids, targets);
+        assert!(snapshot.plan_id.is_none());
+        assert!(events.try_recv().is_err());
+        let persisted = dir.path().join("last-selection.json");
+        let before = fs::read(&persisted).unwrap();
+        backend.snapshot.plan_id = Some("keep-plan".into());
+        assert!(
+            backend
+                .add_local_paths(
+                    &root,
+                    vec![root.join("okay.txt"), root.join("auth.json")],
+                    targets.clone(),
+                    vec![]
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(&persisted).unwrap(), before);
+        assert_eq!(backend.snapshot.plan_id.as_deref(), Some("keep-plan"));
+        assert_eq!(
+            backend.snapshot.selected_item_ids,
+            snapshot.selected_item_ids
+        );
+        assert!(events.try_recv().is_err());
+        let mut restarted = test_backend(dir.path());
+        restarted.profiles = backend.profiles.clone();
+        restarted.last = read_selection(&persisted).unwrap();
+        restarted.restore_startup_selection();
+        assert_eq!(
+            restarted.snapshot.selected_item_ids,
+            snapshot.selected_item_ids
+        );
+        assert_eq!(restarted.snapshot.target_ids, targets);
+        backend.snapshot.source_id = Some(PUBLIC_ID.into());
+        assert!(
+            backend
+                .add_local_paths(&root, vec![root.join("okay.txt")], vec![], vec![])
+                .is_err()
+        );
+        assert_eq!(fs::read(&persisted).unwrap(), before);
+    }
+
+    #[test]
+    fn known_resources_discover_existing_folders_preserve_opt_out_and_never_duplicate() {
+        let dir = picker_tempdir();
+        let root = dir.path().join("agent");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("extensions")).unwrap();
+        fs::create_dir(root.join("skills")).unwrap();
+        fs::create_dir(root.join("auth-cache")).unwrap();
+        let mut backend = test_backend(dir.path());
+        backend.restore_startup_selection_at(Some(&root));
+        assert_eq!(
+            backend.snapshot.selected_item_ids,
+            vec!["path:extensions", "path:skills"]
+        );
+        backend.publish();
+        assert_eq!(
+            backend
+                .snapshot
+                .items
+                .iter()
+                .filter(|item| item.id == "path:extensions")
+                .count(),
+            1
+        );
+        assert_eq!(
+            backend
+                .snapshot
+                .items
+                .iter()
+                .filter(|item| item.id == "path:skills")
+                .count(),
+            1
+        );
+        backend
+            .save_selection(Selection {
+                source: "local".into(),
+                targets: vec![],
+                items: vec![],
+            })
+            .unwrap();
+        let mut restarted = test_backend(dir.path());
+        restarted.last = read_selection(&dir.path().join("last-selection.json")).unwrap();
+        restarted.restore_startup_selection_at(Some(&root));
+        restarted.publish();
+        assert!(restarted.snapshot.selected_item_ids.is_empty());
+        assert_eq!(
+            restarted
+                .snapshot
+                .items
+                .iter()
+                .filter(|item| item.id == "path:extensions")
+                .count(),
+            1
+        );
+        restarted
+            .handle(Command::SelectSource(PUBLIC_ID.into()))
+            .unwrap();
+        assert!(restarted.snapshot.selected_item_ids.is_empty());
+        assert!(
+            !restarted
+                .snapshot
+                .items
+                .iter()
+                .any(|item| item.id.starts_with("path:"))
+        );
+        fs::remove_dir(root.join("skills")).unwrap();
+        assert_eq!(discover_local_resources(&root), vec!["path:extensions"]);
+        fs::remove_dir(root.join("extensions")).unwrap();
+        fs::write(root.join("extensions"), "not a folder").unwrap();
+        assert!(discover_local_resources(&root).is_empty());
+    }
+
+    #[test]
+    fn selecting_current_source_preserves_saved_resource_opt_out_and_review() {
+        let dir = picker_tempdir();
+        let mut backend = test_backend(dir.path());
+        backend
+            .save_selection(Selection {
+                source: "local".into(),
+                targets: vec![],
+                items: vec![],
+            })
+            .unwrap();
+        backend.snapshot.plan_id = Some("keep-review".into());
+        let persisted = dir.path().join("last-selection.json");
+        let before = fs::read(&persisted).unwrap();
+        backend
+            .handle(Command::SelectSource("local".into()))
+            .unwrap();
+        assert!(backend.snapshot.selected_item_ids.is_empty());
+        assert_eq!(backend.snapshot.plan_id.as_deref(), Some("keep-review"));
+        assert_eq!(fs::read(&persisted).unwrap(), before);
+    }
+
+    #[test]
+    fn known_resources_discover_prompts_themes_but_not_agents_or_repositories() {
+        let dir = picker_tempdir();
+        for name in ["prompts", "themes", "agents", "auth"] {
+            fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        assert_eq!(
+            discover_local_resources(dir.path()),
+            vec!["path:prompts", "path:themes"]
+        );
+        fs::create_dir(dir.path().join("themes/.git")).unwrap();
+        fs::write(dir.path().join("themes/.git/HEAD"), "ref: refs/heads/main").unwrap();
+        assert_eq!(discover_local_resources(dir.path()), vec!["path:prompts"]);
+        fs::write(dir.path().join(".git"), "gitdir: elsewhere").unwrap();
+        assert!(discover_local_resources(dir.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn known_resources_do_not_auto_select_symlinked_folders() {
+        let dir = picker_tempdir();
+        fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("extensions")).unwrap();
+        assert!(discover_local_resources(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn native_paths_use_canonical_root_after_raw_safety_checks() {
+        let dir = picker_tempdir();
+        let root = dir.path().join("agent");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("example.txt"), "x").unwrap();
+        assert_eq!(
+            selected_local_items(&root.join("."), &[root.join("example.txt")], vec![]).unwrap(),
+            vec!["path:example.txt"]
+        );
+        assert!(selected_local_items(&root, &[root.join("../agent/example.txt")], vec![]).is_err());
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn native_paths_accept_case_equivalent_roots_on_insensitive_filesystems() {
+        let dir = picker_tempdir();
+        let root = dir.path().join("PickerCase");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("example.txt"), "x").unwrap();
+        let other_spelling = dir.path().join("pickercase");
+        if other_spelling.is_dir() {
+            assert_eq!(
+                selected_local_items(&other_spelling, &[root.join("example.txt")], vec![]).unwrap(),
+                vec!["path:example.txt"]
+            );
+        }
+    }
+
+    #[test]
+    fn native_root_expands_supported_home_forms_without_global_environment() {
+        let home = picker_tempdir();
+        assert_eq!(expand_local_root("~", home.path()).unwrap(), home.path());
+        assert_eq!(
+            expand_local_root("~/.pi/agent", home.path()).unwrap(),
+            home.path().join(".pi/agent")
+        );
+        assert_eq!(
+            expand_local_root("~\\.pi/agent", home.path()).unwrap(),
+            home.path().join(".pi/agent")
+        );
+        assert!(expand_local_root("relative", home.path()).is_err());
+        assert!(expand_local_root("~/../escape", home.path()).is_err());
+    }
+
     #[test]
     fn cancellation_preserves_fifo_commands_and_drops_stale_prompt_answers() {
         let dir = tempfile::tempdir().unwrap();

@@ -66,6 +66,11 @@ pub(crate) enum Command {
         choices: BTreeMap<String, Choice>,
     },
     Refresh,
+    AddLocalPaths {
+        paths: Vec<std::path::PathBuf>,
+        targets: Vec<String>,
+        items: Vec<String>,
+    },
     AddDevice {
         name: String,
         ssh_line: String,
@@ -120,6 +125,7 @@ pub(crate) struct FilePreview {
 pub(crate) enum Event {
     FilePreview(FilePreview),
     Snapshot(Snapshot),
+    LocalPathsAdded(Snapshot),
     SelectionSaved {
         has_last_selection: bool,
     },

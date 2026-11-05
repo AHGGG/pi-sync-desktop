@@ -1,5 +1,5 @@
 //! Real production-view integration tests. Fixtures exist only in this module.
-use super::Workspace;
+use super::{LocalPathKind, Workspace, combined_local_picker};
 use crate::ui_model::{Change, Choice, Command, ConfigItem, Device, Snapshot};
 use gpui_kit::test::{TestQueryExt, TestWindowExt};
 use gpui_kit::{
@@ -337,7 +337,7 @@ fn startup_restores_selection_once_and_save_ack_does_not_clear_busy(cx: &mut Tes
 }
 
 #[gpui_kit::test]
-fn custom_path_is_remembered_only_on_dialog_confirmation(cx: &mut TestAppContext) {
+fn remote_path_is_remembered_only_on_dialog_confirmation(cx: &mut TestAppContext) {
     let (handle, view, received) = window(cx, false);
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
@@ -359,6 +359,370 @@ fn custom_path_is_remembered_only_on_dialog_confirmation(cx: &mut TestAppContext
         assert!(received.try_recv().is_err());
     })
     .unwrap();
+}
+
+fn make_local_source(view: &Entity<Workspace>, cx: &mut gpui_kit::App) {
+    view.update(cx, |view, cx| {
+        view.snapshot.source_id = Some("local".into());
+        view.snapshot.devices[0].id = "local".into();
+        view.snapshot.devices[0].address = "/fixture/pi-agent".into();
+        cx.notify();
+    });
+}
+
+#[gpui_kit::test]
+fn resource_defaults_follow_source_changes_but_never_override_same_source_opt_out(
+    cx: &mut TestAppContext,
+) {
+    let (handle, view, received) = window(cx, false);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            let mut local = view.snapshot.clone();
+            local.source_id = Some("local".into());
+            local.devices[0].id = "local".into();
+            local.items.push(ConfigItem { id: "path:extensions".into(), name: "Extensions".into(), category: "Pi resources".into(), detail: "extensions/".into() });
+            local.selected_item_ids = vec!["path:extensions".into()];
+            view.receive(crate::ui_model::Event::Snapshot(local), window, cx);
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("select-path:extensions").checked(), Some(true));
+        window.click("select-path:extensions", cx);
+        assert!(!view.read(cx).selected.contains("path:extensions"));
+        assert!(matches!(received.try_recv(), Ok(Command::SaveSelection { items, .. }) if items.is_empty()));
+        view.update(cx, |view, cx| {
+            let stale = view.snapshot.clone();
+            view.receive(crate::ui_model::Event::Snapshot(stale), window, cx);
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("select-path:extensions").checked(), Some(false));
+        window.click("change-source", cx);
+        window.click("source-local", cx);
+        assert_eq!(window.find("select-path:extensions").checked(), Some(false));
+        assert!(received.try_recv().is_err(), "reselecting the same source preserves opt-out without saving a different scope");
+    }).unwrap();
+}
+
+#[test]
+fn combined_picker_requires_macos_and_native_support() {
+    assert!(combined_local_picker("macos", true));
+    assert!(!combined_local_picker("macos", false));
+    assert!(!combined_local_picker("windows", true));
+    assert!(!combined_local_picker("windows", false));
+    assert!(!combined_local_picker("linux", true));
+    assert!(!combined_local_picker("linux", false));
+}
+
+#[gpui_kit::test]
+fn picker_button_layout_uses_the_native_platform_capability(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, false);
+    cx.update_window(handle, |_, window, cx| {
+        make_local_source(&view, cx);
+        window.render_frame(cx);
+        window.click("add-path", cx);
+        let mixed =
+            combined_local_picker(std::env::consts::OS, cx.can_select_mixed_files_and_dirs());
+        assert_eq!(
+            window.within("dialog").find_all("choose-local-items").len(),
+            usize::from(mixed)
+        );
+        assert_eq!(
+            window.within("dialog").find_all("choose-local-files").len(),
+            usize::from(!mixed)
+        );
+        assert_eq!(
+            window
+                .within("dialog")
+                .find_all("choose-local-folders")
+                .len(),
+            usize::from(!mixed)
+        );
+        window.within("dialog").click("cancel", cx);
+    })
+    .unwrap();
+    assert!(received.try_recv().is_err());
+    assert!(!cx.did_prompt_for_paths());
+}
+
+#[gpui_kit::test]
+fn combined_picker_uses_one_button_and_accepts_files_and_folders_together(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, false);
+    for response in [
+        None,
+        Some(vec![
+            "/fixture/pi-agent/file.txt".into(),
+            "/fixture/pi-agent/skills".into(),
+        ]),
+    ] {
+        cx.update_window(handle, |_, window, cx| {
+            make_local_source(&view, cx);
+            view.update(cx, |view, cx| {
+                view.show_local_path_picker_with_mixed(true, window, cx)
+            });
+            window.render_frame(cx);
+            assert!(
+                window
+                    .within("dialog")
+                    .find_all("choose-local-files")
+                    .is_empty()
+            );
+            assert!(
+                window
+                    .within("dialog")
+                    .find_all("choose-local-folders")
+                    .is_empty()
+            );
+            window.within("dialog").click("choose-local-items", cx);
+            assert!(view.read(cx).path_picker_open);
+            assert!(received.try_recv().is_err());
+        })
+        .unwrap();
+        let expected = response.clone();
+        cx.simulate_path_prompt_response(|options| {
+            assert!(options.files && options.directories && options.multiple);
+            response
+        });
+        cx.run_until_parked();
+        if let Some(expected) = expected {
+            match received.try_recv().unwrap() {
+                Command::AddLocalPaths { paths, .. } => assert_eq!(paths, expected),
+                _ => panic!("combined picker must request validation only"),
+            }
+        } else {
+            assert!(received.try_recv().is_err(), "cancel must not save or sync");
+        }
+        cx.update(|cx| {
+            assert!(!view.read(cx).path_picker_open);
+            assert!(
+                view.read(cx).selected.is_empty(),
+                "mixed selections need worker validation too"
+            );
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn native_file_picker_stages_multiple_paths_only_after_worker_validation(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, false);
+    cx.update_window(handle, |_, window, cx| {
+        make_local_source(&view, cx);
+        view.update(cx, |view, _| {
+            view.selected.insert("settings".into());
+            view.targets.insert("target".into());
+        });
+        window.render_frame(cx);
+        view.update(cx, |view, cx| {
+            view.show_local_path_picker_with_mixed(false, window, cx)
+        });
+        window.render_frame(cx);
+        assert!(window.within("dialog").find_all("custom-path").is_empty());
+        window.within("dialog").click("copy-pi-root", cx);
+        assert_eq!(
+            cx.read_from_clipboard().unwrap().text().as_deref(),
+            Some("/fixture/pi-agent")
+        );
+        window.within("dialog").click("choose-local-files", cx);
+        assert!(window.find_all("dialog").is_empty());
+        assert!(view.read(cx).path_picker_open);
+        assert_eq!(window.find("change-source").disabled(), Some(true));
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+    assert!(cx.did_prompt_for_paths());
+    cx.simulate_path_prompt_response(|options| {
+        assert!(options.files);
+        assert!(!options.directories);
+        assert!(options.multiple);
+        Some(vec![
+            "/fixture/pi-agent/a.txt".into(),
+            "/fixture/pi-agent/b.txt".into(),
+        ])
+    });
+    cx.run_until_parked();
+    match received.try_recv().expect("worker validation request") {
+        Command::AddLocalPaths {
+            paths,
+            targets,
+            items,
+        } => {
+            assert_eq!(
+                paths,
+                [
+                    std::path::PathBuf::from("/fixture/pi-agent/a.txt"),
+                    "/fixture/pi-agent/b.txt".into()
+                ]
+            );
+            assert_eq!(targets, ["target"]);
+            assert_eq!(items, ["settings"]);
+        }
+        _ => panic!("picker must only request worker validation, never review or apply"),
+    }
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(
+            view.read(cx).selected.len(),
+            1,
+            "unvalidated files are not staged"
+        );
+        assert!(view.read(cx).busy.is_some());
+        view.update(cx, |view, cx| {
+            let mut saved = view.snapshot.clone();
+            saved.selected_item_ids =
+                vec!["settings".into(), "path:a.txt".into(), "path:b.txt".into()];
+            saved.target_ids = vec!["target".into()];
+            saved.has_last_selection = true;
+            view.receive(crate::ui_model::Event::LocalPathsAdded(saved), window, cx);
+        });
+        assert!(view.read(cx).selected.contains("path:a.txt"));
+        assert!(view.read(cx).selected.contains("path:b.txt"));
+        assert!(view.read(cx).targets.contains("target"));
+        assert!(view.read(cx).busy.is_none());
+        assert!(view.read(cx).snapshot.has_last_selection);
+        assert!(view.read(cx).snapshot.plan_id.is_none());
+    })
+    .unwrap();
+    assert!(received.try_recv().is_err());
+}
+
+#[gpui_kit::test]
+fn picker_cancel_empty_result_and_repeated_open_leave_selection_unchanged(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, false);
+    cx.update_window(handle, |_, window, cx| {
+        make_local_source(&view, cx);
+        view.update(cx, |view, _| {
+            view.selected.insert("settings".into());
+        });
+        window.render_frame(cx);
+        view.update(cx, |view, cx| {
+            view.show_local_path_picker_with_mixed(false, window, cx)
+        });
+        window.render_frame(cx);
+        window.within("dialog").click("cancel", cx);
+        assert!(window.find_all("dialog").is_empty());
+    })
+    .unwrap();
+    assert!(!cx.did_prompt_for_paths());
+    for response in [None, Some(vec![])] {
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.show_local_path_picker_with_mixed(false, window, cx)
+            });
+            window.render_frame(cx);
+            window.within("dialog").click("choose-local-folders", cx);
+            view.update(cx, |view, cx| {
+                view.pick_local_paths(LocalPathKind::Folders, window, cx)
+            });
+            assert!(view.read(cx).path_picker_open);
+        })
+        .unwrap();
+        cx.simulate_path_prompt_response(|options| {
+            assert!(!options.files);
+            assert!(options.directories && options.multiple);
+            response
+        });
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!view.read(cx).path_picker_open);
+            assert!(!view.read(cx).is_busy());
+            assert!(view.read(cx).error.is_none());
+            assert_eq!(
+                view.read(cx).selected.iter().cloned().collect::<Vec<_>>(),
+                ["settings"]
+            );
+            assert_ne!(window.find("add-path").disabled(), Some(true));
+        })
+        .unwrap();
+        assert!(received.try_recv().is_err());
+    }
+}
+
+#[gpui_kit::test]
+fn native_picker_cannot_attach_result_to_a_changed_source(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, false);
+    cx.update_window(handle, |_, window, cx| {
+        make_local_source(&view, cx);
+        window.render_frame(cx);
+        view.update(cx, |view, cx| {
+            view.show_local_path_picker_with_mixed(false, window, cx)
+        });
+        window.render_frame(cx);
+        window.within("dialog").click("choose-local-files", cx);
+        view.update(cx, |view, cx| {
+            let mut changed = view.snapshot.clone();
+            changed.source_id = Some("target".into());
+            view.receive(crate::ui_model::Event::Snapshot(changed), window, cx);
+        });
+        assert!(
+            view.read(cx).is_busy(),
+            "snapshot cannot unlock an outstanding OS dialog"
+        );
+    })
+    .unwrap();
+    cx.simulate_path_prompt_response(|_| Some(vec!["/fixture/pi-agent/a.txt".into()]));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(view.read(cx).selected.is_empty());
+        assert!(
+            view.read(cx)
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("source changed")
+        );
+        assert!(!view.read(cx).path_picker_open);
+    });
+    assert!(received.try_recv().is_err());
+}
+
+#[gpui_kit::test]
+fn picker_validation_error_leaves_previous_selection_and_allows_retry(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, false);
+    cx.update_window(handle, |_, window, cx| {
+        make_local_source(&view, cx);
+        view.update(cx, |view, _| {
+            view.selected.insert("settings".into());
+        });
+        window.render_frame(cx);
+        view.update(cx, |view, cx| {
+            view.show_local_path_picker_with_mixed(false, window, cx)
+        });
+        window.render_frame(cx);
+        window.within("dialog").click("choose-local-folders", cx);
+    })
+    .unwrap();
+    cx.simulate_path_prompt_response(|_| Some(vec!["/outside-root".into()]));
+    cx.run_until_parked();
+    assert!(matches!(
+        received.try_recv(),
+        Ok(Command::AddLocalPaths { .. })
+    ));
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.receive(
+                crate::ui_model::Event::Error("Choose items inside the Pi directory".into()),
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert_eq!(
+            view.read(cx).selected.iter().cloned().collect::<Vec<_>>(),
+            ["settings"]
+        );
+        assert!(!view.read(cx).is_busy());
+        view.update(cx, |view, cx| {
+            view.show_local_path_picker_with_mixed(false, window, cx)
+        });
+        window.render_frame(cx);
+        assert!(
+            !window
+                .within("dialog")
+                .find_all("choose-local-files")
+                .is_empty()
+        );
+        window.within("dialog").click("cancel", cx);
+    })
+    .unwrap();
+    assert!(received.try_recv().is_err());
 }
 
 #[gpui_kit::test]

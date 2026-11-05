@@ -40,6 +40,17 @@ actions!(
     ]
 );
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalPathKind {
+    Files,
+    Folders,
+    Mixed,
+}
+
+fn combined_local_picker(platform: &str, supported: bool) -> bool {
+    platform == "macos" && supported
+}
+
 #[derive(Clone)]
 struct DragItem {
     id: String,
@@ -119,6 +130,7 @@ pub(crate) struct Workspace {
     onboarding: bool,
     initial_snapshot_received: bool,
     source_picker_open: bool,
+    path_picker_open: bool,
     review_change_id: Option<String>,
     review_pending_only: bool,
     review_hovered_side: Option<Choice>,
@@ -207,6 +219,7 @@ impl Workspace {
             onboarding: false,
             initial_snapshot_received: false,
             source_picker_open: false,
+            path_picker_open: false,
             review_change_id: None,
             review_pending_only: false,
             review_hovered_side: None,
@@ -224,6 +237,10 @@ impl Workspace {
         };
         let _ = this.commands.send(Command::Refresh);
         this
+    }
+
+    fn is_busy(&self) -> bool {
+        self.busy.is_some() || self.path_picker_open
     }
 
     fn send(&mut self, command: Command, message: &str, cx: &mut Context<Self>) {
@@ -255,7 +272,7 @@ impl Workspace {
         self.snapshot.blocked_targets.clear();
     }
     fn stage(&mut self, id: String, cx: &mut Context<Self>) {
-        if self.busy.is_some() {
+        if self.is_busy() {
             return;
         }
         self.selected.insert(id);
@@ -265,7 +282,7 @@ impl Workspace {
     fn prepare(&mut self, cx: &mut Context<Self>) {
         if self.onboarding
             || self.snapshot.plan_id.is_some()
-            || self.busy.is_some()
+            || self.is_busy()
             || self.targets.is_empty()
             || self.selected.is_empty()
         {
@@ -300,6 +317,12 @@ impl Workspace {
                         self.selected = snapshot.selected_item_ids.iter().cloned().collect();
                         self.targets = snapshot.target_ids.iter().cloned().collect();
                     }
+                }
+                // A source switch owns a new scope. Ordinary same-source
+                // refreshes still leave unsent staging choices untouched.
+                if snapshot.source_id != self.snapshot.source_id {
+                    self.selected = snapshot.selected_item_ids.iter().cloned().collect();
+                    self.targets = snapshot.target_ids.iter().cloned().collect();
                 }
                 if let Some((items, targets)) =
                     snapshot.restored_selection(self.snapshot.plan_id.as_deref())
@@ -469,6 +492,15 @@ impl Workspace {
                     });
                 }
                 self.busy = None;
+            }
+            Event::LocalPathsAdded(snapshot) => {
+                // Only the worker can validate and remember an OS picker result.
+                // Never optimistically add an absolute or partially valid selection.
+                self.selected = snapshot.selected_item_ids.iter().cloned().collect();
+                self.targets = snapshot.target_ids.iter().cloned().collect();
+                self.invalidate_review();
+                self.error = None;
+                self.receive(Event::Snapshot(snapshot), window, cx);
             }
             Event::SelectionSaved { has_last_selection } => {
                 self.snapshot.has_last_selection = has_last_selection;
@@ -716,15 +748,134 @@ impl Workspace {
     }
 
     fn add_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_busy() || self.snapshot.plan_id.is_some() {
+            return;
+        }
+        match self.snapshot.source_id.as_deref() {
+            Some("local") => self.show_local_path_picker(window, cx),
+            Some("public-harness") | None => {}
+            Some(_) => self.add_remote_path(window, cx),
+        }
+    }
+
+    fn show_local_path_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mixed =
+            combined_local_picker(std::env::consts::OS, cx.can_select_mixed_files_and_dirs());
+        self.show_local_path_picker_with_mixed(mixed, window, cx);
+    }
+
+    pub(crate) fn show_local_path_picker_with_mixed(
+        &mut self,
+        mixed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let root = self
+            .snapshot
+            .devices
+            .iter()
+            .find(|device| device.id == "local")
+            .map(|device| device.address.clone())
+            .unwrap_or_else(|| "~/.pi/agent".into());
+        let entity = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |dialog, _, cx| {
+            let mixed_entity = entity.clone();
+            let files_entity = entity.clone();
+            let folders_entity = entity.clone();
+            let clipboard_root = root.clone();
+            dialog.title("Add files or folders")
+                .child(div().text_sm().child("Choose items inside your Pi directory:"))
+                .child(div().p_3().rounded(cx.theme().radius).bg(cx.theme().muted)
+                    .flex().items_center().gap_2()
+                    .child(div().flex_1().min_w_0().text_sm().child(root.clone()))
+                    .child(Button::new("copy-pi-root").ghost().small().label("Copy path")
+                        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(clipboard_root.clone())))))
+                .child(div().flex().gap_3()
+                    .when(mixed, |el| el.child(Button::new("choose-local-items").flex_1().label("Choose files or folders…")
+                        .on_click(move |_, window, cx| {
+                            let _ = mixed_entity.update(cx, |this, cx| this.pick_local_paths(LocalPathKind::Mixed, window, cx));
+                        })))
+                    .when(!mixed, |el| el
+                        .child(Button::new("choose-local-files").flex_1().label("Choose files…")
+                            .on_click(move |_, window, cx| {
+                                let _ = files_entity.update(cx, |this, cx| this.pick_local_paths(LocalPathKind::Files, window, cx));
+                            }))
+                        .child(Button::new("choose-local-folders").flex_1().label("Choose folders…")
+                            .on_click(move |_, window, cx| {
+                                let _ = folders_entity.update(cx, |this, cx| this.pick_local_paths(LocalPathKind::Folders, window, cx));
+                            }))))
+                .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                    .child("Select multiple items at once. Folders include their contents. You’ll review every file before syncing."))
+                .footer(div().flex().justify_end().child(Button::new("cancel").label("Cancel")
+                    .on_click(|_, window, cx| window.close_dialog(cx))))
+        });
+    }
+
+    fn pick_local_paths(
+        &mut self,
+        kind: LocalPathKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_busy()
+            || self.snapshot.source_id.as_deref() != Some("local")
+            || self.snapshot.plan_id.is_some()
+        {
+            return;
+        }
+        // macOS can choose files and folders together. Windows and Linux keep
+        // separate native dialogs so directory mode never silently hides files.
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: kind != LocalPathKind::Folders,
+            directories: kind != LocalPathKind::Files,
+            multiple: true,
+            prompt: Some(
+                match kind {
+                    LocalPathKind::Files => "Add files",
+                    LocalPathKind::Folders => "Add folders",
+                    LocalPathKind::Mixed => "Add selected items",
+                }
+                .into(),
+            ),
+        });
+        self.path_picker_open = true;
+        window.close_dialog(cx);
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = paths.await;
+            let _ = this.update_in(cx, |this, _, cx| {
+                this.path_picker_open = false;
+                match result {
+                    Ok(Ok(Some(paths))) if !paths.is_empty() => {
+                        if this.snapshot.source_id.as_deref() != Some("local")
+                            || this.snapshot.plan_id.is_some() || this.busy.is_some() {
+                            this.error = Some("The source changed while choosing files. Open the picker again for your current source.".into());
+                        } else {
+                            this.send(Command::AddLocalPaths {
+                                paths,
+                                targets: this.targets.iter().cloned().collect(),
+                                items: this.selected.iter().cloned().collect(),
+                            }, "Checking and remembering selected files", cx);
+                        }
+                    },
+                    Ok(Ok(_)) => {}, // Cancel and an empty OS result leave the selection untouched.
+                    _ => this.error = Some("The file picker could not open. Check that your system file chooser is available, then try again.".into()),
+                }
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    fn add_remote_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path = cx.new(|cx| {
             InputState::new(window, cx).placeholder("extensions or skills/my-skill/SKILL.md")
         });
         let entity = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |dialog, _, _| {
             let path = path.clone(); let entity = entity.clone();
-            dialog.title("Choose a file or folder").confirm()
+            dialog.title("Add from SSH source").confirm()
                 .button_props(DialogButtonProps::default().ok_text("Remember selection"))
-                .child("Enter a path relative to the source Pi agent directory. It will be copied to the same relative path on each selected target.")
+                .child("The system file picker only browses this computer. Enter a path inside the SSH source’s Pi directory. It will use the same relative path on each target.")
                 .child(Input::new(&path).id("custom-path"))
                 .child("Folders are recursive. Target-only files stay untouched. Authentication and sync-state files are blocked. Use the built-in selections for settings.json, mcp.json, subagents.json and models.json.")
                 .child("Selected extension code can execute in Pi. Standalone permission policies can change tool access. Every file requires an explicit decision in review.")
@@ -779,7 +930,7 @@ impl Workspace {
                     Button::new("repeat-last")
                         .ghost()
                         .label("Review saved selection")
-                        .disabled(self.busy.is_some() || !self.snapshot.has_last_selection)
+                        .disabled(self.is_busy() || !self.snapshot.has_last_selection)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.send(
                                 Command::RepeatLast,
@@ -794,7 +945,7 @@ impl Workspace {
                     Button::new("refresh")
                         .ghost()
                         .label("Refresh")
-                        .disabled(self.busy.is_some())
+                        .disabled(self.is_busy())
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.invalidate_review();
                             this.send(Command::Refresh, "Refreshing devices", cx);
@@ -843,7 +994,7 @@ impl Workspace {
                         .child(Field::new().label("Pi agent directory on this device").child(Input::new(&self.setup_root).id("setup-agent-root"))))
                     .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Use ssh [user@]host-or-alias. OpenSSH configuration supplies omitted user and port."))
                     .child(div().text_sm().text_color(cx.theme().muted_foreground).child(format!("SSH client: {}", sync_core::transport::ssh_client_description())))
-                    .child(Button::new("save-connection").primary().label("Save connection").disabled(self.busy.is_some())
+                    .child(Button::new("save-connection").primary().label("Save connection").disabled(self.is_busy())
                         .on_click(cx.listener(|this, _, _, cx| {
                             let name = this.setup_name.read(cx).value().trim().to_string();
                             let ssh_line = this.setup_ssh.read(cx).value().trim().to_string();
@@ -860,7 +1011,7 @@ impl Workspace {
                         .child(div().flex_1().min_w_0().child(device.name.clone()).child(div().text_xs().text_color(cx.theme().muted_foreground).child(device.address.clone())))
                         .child(div().text_xs().text_color(cx.theme().muted_foreground).child(Self::platform_label(device)))))))
             .child(div().flex().justify_end().child(Button::new("setup-next").primary().label("Next: choose what to sync")
-                .disabled(self.busy.is_some() || saved.is_empty())
+                .disabled(self.is_busy() || saved.is_empty())
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.onboarding = false;
                     if this.targets.is_empty()
@@ -870,7 +1021,7 @@ impl Workspace {
     }
 
     fn render_items(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let busy = self.busy.is_some();
+        let busy = self.is_busy();
         let source = self
             .snapshot
             .devices
@@ -890,7 +1041,7 @@ impl Workspace {
         div().id("source-selection").flex().flex_col().size_full().min_w_0()
             .child(div().px_5().pt_5().pb_4()
                 .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("What to sync"))
-                .child(div().mt_1().text_sm().text_color(cx.theme().muted_foreground).child("Choose once. Your selection is remembered for the next review."))
+                .child(div().mt_1().text_sm().text_color(cx.theme().muted_foreground).child("Standard Pi folders are listed below. Your choices are remembered."))
                 .when_some(source, |el, device| el.child(div().mt_4().p_3().flex().items_center().gap_3().rounded(cx.theme().radius).bg(cx.theme().muted)
                     .child(Self::device_icon(device))
                     .child(div().flex_1().min_w_0().child(div().font_weight(FontWeight::MEDIUM).child(format!("From {}", device.name))).child(div().text_xs().text_color(cx.theme().muted_foreground).child(device.address.clone())))
@@ -903,6 +1054,10 @@ impl Workspace {
                         .selected(self.snapshot.source_id.as_ref() == Some(&id)).disabled(busy)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.source_picker_open = false;
+                            if this.snapshot.source_id.as_ref() == Some(&id) {
+                                cx.notify();
+                                return;
+                            }
                             this.selected.clear(); this.targets.remove(&id); this.invalidate_review();
                             this.send(Command::SelectSource(id.clone()), "Changing source", cx);
                         }))
@@ -913,7 +1068,9 @@ impl Workspace {
                 .children(items.map(|item| {
                     let id = item.id.clone(); let checked = self.selected.contains(&id);
                     let drag = DragItem { id: id.clone(), name: item.name.clone() };
-                    div().id(SharedString::from(format!("config-{id}"))).test_support().p_4().rounded(cx.theme().radius)
+                    div().id(SharedString::from(format!("config-{id}"))).test_support().p_4()
+                        .when(item.category == "Pi resources", |el| el.p_3())
+                        .rounded(cx.theme().radius)
                         .border_1().border_color(if checked { cx.theme().primary } else { cx.theme().border })
                         .bg(if checked { cx.theme().accent } else { cx.theme().background })
                         .when(!busy, |el| el.on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone())))
@@ -922,14 +1079,14 @@ impl Workspace {
                                 if *checked { this.selected.insert(id.clone()); } else { this.selected.remove(&id); }
                                 this.invalidate_review(); this.save_selection(cx);
                             })))
-                        .child(div().mt_2().text_xs().text_color(cx.theme().muted_foreground).child(item.category.clone()))
+                        .when(item.category != "Pi resources", |el| el.child(div().mt_2().text_xs().text_color(cx.theme().muted_foreground).child(item.category.clone())))
                         .child(div().mt_1().text_sm().text_color(cx.theme().muted_foreground).child(item.detail.clone()))
                 })))
             .child(div().px_5().py_3().border_t_1().border_color(cx.theme().border).text_xs().text_color(cx.theme().muted_foreground).child("Paths are relative to each device's Pi directory. Authentication files stay local. Built-in settings preserve device identity, model defaults, shell and embedded permissions."))
     }
 
     fn render_queue(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let busy = self.busy.is_some();
+        let busy = self.is_busy();
         let eligible = self
             .snapshot
             .devices
@@ -982,7 +1139,7 @@ impl Workspace {
         self.snapshot.unresolved_count(&self.choices)
     }
     fn confirm_apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy.is_some() || self.unresolved() != 0 {
+        if self.is_busy() || self.unresolved() != 0 {
             return;
         }
         let Some(plan_id) = self.snapshot.plan_id.clone() else {
@@ -1026,7 +1183,7 @@ impl Workspace {
                 .child(format!("Targets: {targets}"))
                 .when(private_transfer, |dialog| dialog.child("Selected source files replace entire target files. This selection includes whole files or MCP values that may contain private data. Extension code can execute in Pi; standalone permission policies can change tool access. Hidden or truncated contents are still copied in full to the named targets."))
                 .on_ok(move |_, _, cx| entity.update(cx, |this, cx| {
-                    if this.busy.is_some() || this.snapshot.plan_id.as_ref() != Some(&plan_id) { return false; }
+                    if this.is_busy() || this.snapshot.plan_id.as_ref() != Some(&plan_id) { return false; }
                     this.send(Command::Apply { plan_id: plan_id.clone(), choices: choices.clone() }, "Applying the reviewed changes", cx);
                     true
                 }).unwrap_or(false))
@@ -1054,7 +1211,7 @@ impl Workspace {
     }
 
     fn choose_review_side(&mut self, id: &str, choice: Choice, cx: &mut Context<Self>) {
-        if self.busy.is_some() || self.snapshot.plan_id.is_none() {
+        if self.is_busy() || self.snapshot.plan_id.is_none() {
             return;
         }
         let Some(change) = self.snapshot.changes.iter().find(|change| change.id == id) else {
@@ -1157,7 +1314,7 @@ impl Workspace {
     }
 
     fn navigate_review(&mut self, id: &str, forward: bool, cx: &mut Context<Self>) {
-        if self.busy.is_some() || self.snapshot.plan_id.is_none() {
+        if self.is_busy() || self.snapshot.plan_id.is_none() {
             return;
         }
         let Some(destination) = self.review_destination(id, forward) else {
@@ -1208,7 +1365,7 @@ impl Workspace {
     }
 
     fn select_all_source_changes(&mut self, cx: &mut Context<Self>) {
-        if self.busy.is_some() || self.snapshot.plan_id.is_none() {
+        if self.is_busy() || self.snapshot.plan_id.is_none() {
             return;
         }
         self.close_file_review();
@@ -1321,11 +1478,11 @@ impl Workspace {
                     let next_id = change.id.clone();
                     el.child(Button::new("previous-diff-hunk").small().ghost().label("↑")
                         .accessibility_label(previous_label.clone()).tooltip(format!("{previous_label} · Alt+↑"))
-                        .disabled(self.busy.is_some() || previous.is_none())
+                        .disabled(self.is_busy() || previous.is_none())
                         .on_click(cx.listener(move |this, _, _, cx| this.navigate_review(&previous_id, false, cx))))
                       .child(Button::new("next-diff-hunk").small().ghost().label("↓")
                         .accessibility_label(next_label.clone()).tooltip(format!("{next_label} · Alt+↓"))
-                        .disabled(self.busy.is_some() || next.is_none())
+                        .disabled(self.is_busy() || next.is_none())
                         .on_click(cx.listener(move |this, _, _, cx| this.navigate_review(&next_id, true, cx))))
                 })
                 .child(Button::new("review-full-file").small().label("Review full file…")
@@ -1334,7 +1491,7 @@ impl Workspace {
                     .on_click(cx.listener(move |this, _, window, cx| this.confirm_file_review(file_id.clone(), window, cx))))
                 .child(Button::new("use-source-all").small().label("Use source for all changes →")
                     .tooltip(format!("Select source for {eligible} changes. {unavailable} unavailable sources are excluded. Nothing is written until you confirm sync."))
-                    .disabled(self.busy.is_some() || eligible == 0)
+                    .disabled(self.is_busy() || eligible == 0)
                     .on_click(cx.listener(|this, _, _, cx| this.select_all_source_changes(cx)))))
             .child(div().flex().items_stretch()
                 .child(self.review_column_header(change, Choice::Source, source_name, source.map(|d| d.address.clone()).unwrap_or_default(), destination_name.clone(), cx))
@@ -1477,7 +1634,7 @@ impl Workspace {
                 )
                 .accessibility_label(label.clone())
                 .tooltip(label)
-                .disabled(self.busy.is_some() || !can_move)
+                .disabled(self.is_busy() || !can_move)
                 .on_click(cx.listener(move |this, event, _, cx| {
                     // Navigation is independent of version selection. Never let
                     // an arrow click become a choice on the content beneath it.
@@ -1509,7 +1666,7 @@ impl Workspace {
     ) -> impl IntoElement {
         let selected = self.review_choice(change) == Some(side);
         let source = side == Choice::Source;
-        let disabled = self.busy.is_some() || (source && !change.source_available);
+        let disabled = self.is_busy() || (source && !change.source_available);
         let hovered = self.review_hovered_side == Some(side)
             && !disabled
             && !matches!(self.review_hover_owner, Some("source-edge" | "target-edge"));
@@ -1644,7 +1801,7 @@ impl Workspace {
         content: String,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let disabled = self.busy.is_some() || (side == Choice::Source && !change.source_available);
+        let disabled = self.is_busy() || (side == Choice::Source && !change.source_available);
         div()
             .id(SharedString::from(format!(
                 "opaque-side-{side:?}-{}",
@@ -1863,7 +2020,7 @@ impl Workspace {
             .when(changes.iter().any(|change| change.path.starts_with("mcp.json")), |el| el.child(
                 div().px_5().py_3().flex().items_center().gap_3().border_b_1().border_color(cx.theme().border)
                     .child(Button::new("reveal-command-details").small().label(if self.snapshot.command_details_reviewed { "Command details shown" } else { "Reveal command details" })
-                        .disabled(self.busy.is_some() || self.snapshot.command_details_reviewed)
+                        .disabled(self.is_busy() || self.snapshot.command_details_reviewed)
                         .on_click(cx.listener(|this, _, _, cx| {
                             if let Some(plan_id) = this.snapshot.plan_id.clone() { this.send(Command::RevealDetails { plan_id }, "Reading command details for this review", cx); }
                         })))
@@ -1927,13 +2084,13 @@ impl Workspace {
                     else if needs_details { "Review MCP command details to continue".into() }
                     else { format!("{copies} to copy · {kept} kept") }))
                 .when(unavailable > 0, |el| el.child(div().text_xs().text_color(cx.theme().danger).child(format!("{unavailable} source unavailable"))))
-                .child(Button::new("back-to-selection").label("Cancel review").disabled(self.busy.is_some())
+                .child(Button::new("back-to-selection").label("Cancel review").disabled(self.is_busy())
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.invalidate_review();
                         this.send(Command::CancelReview, "Returning to your saved selection", cx);
                     })))
                 .child(Button::new("apply-reviewed").primary().label("Confirm sync…")
-                    .disabled(self.busy.is_some() || self.full_file_review.is_some() || unresolved > 0 || needs_details || changes.is_empty())
+                    .disabled(self.is_busy() || self.full_file_review.is_some() || unresolved > 0 || needs_details || changes.is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.confirm_apply(window, cx)))))
     }
 }
