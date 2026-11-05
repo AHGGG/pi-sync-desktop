@@ -1,5 +1,6 @@
 //! Native GPUI entry point. No webview or embedded browser runtime.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+mod assets;
 mod backend;
 mod ui_model;
 mod workspace;
@@ -10,7 +11,7 @@ use gpui_kit::*;
 fn main() {
     let (commands, events) = backend::start();
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(assets::AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
             Theme::change(ThemeMode::Light, None, cx);

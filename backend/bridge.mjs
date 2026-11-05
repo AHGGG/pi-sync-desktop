@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // The stdout pipe is a private protocol, not a log. Never forward its raw contents to diagnostics.
 import { SyncEngine, safeError } from "./engine.mjs";
+import { MAX_PROTOCOL_BYTES } from "./worker.mjs";
 const pending = new Map();
 let sequence = 0,
   queue = Promise.resolve(),
@@ -52,6 +53,11 @@ function review(result) {
                 : redact(row[key]);
           }
       }
+    }
+  for (const target of result.targets ?? [])
+    for (const file of target.files ?? []) {
+      file.before = redact(file.before);
+      file.after = redact(file.after);
     }
   return result;
 }
@@ -124,13 +130,13 @@ process.stdin.on("data", (chunk) => {
   while ((end = buffer.indexOf("\n")) !== -1) {
     const next = buffer.slice(0, end);
     buffer = buffer.slice(end + 1);
-    if (Buffer.byteLength(next) > 16 * 1024 * 1024) {
+    if (Buffer.byteLength(next) > MAX_PROTOCOL_BYTES) {
       write({ id: null, ok: false, error: { code: "REQUEST_TOO_LARGE" } });
       continue;
     }
     if (next.trim()) line(next);
   }
-  if (Buffer.byteLength(buffer) > 16 * 1024 * 1024) {
+  if (Buffer.byteLength(buffer) > MAX_PROTOCOL_BYTES) {
     write({ id: null, ok: false, error: { code: "REQUEST_TOO_LARGE" } });
     process.exit(2);
   }

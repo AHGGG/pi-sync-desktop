@@ -9,10 +9,13 @@ The public source fetches only JSON from AHGGG/my-pi-harness, resolving HEAD to 
 ## Native workspace
 
 - One light native window, familiar resizable panes, semantic GPUI Kit controls.
-- Source cards on the left, Pi configuration or per-setting review in the center, staging and destination selection on the right.
+- First-run SSH setup saves connections before continuing. This computer is the default source.
+- Two selection panes: source and selected configuration/files on the left, saved target-device cards on the right. Remote OS is not guessed.
+- Review replaces both panes. Cancel preserves the selection and discards the plan; confirmation is a separate action.
 - Drag-and-drop is an accelerator. Buttons and keyboard actions provide the same staging flow.
 - Confirmation summarizes scope; conflict choices never silently default to source.
-- Errors and per-device outcomes use text, not color alone. A new selection invalidates the displayed review.
+- Errors and per-device outcomes use text, not color alone. Blocked reviews never appear as a successful zero-difference result. A new selection invalidates the displayed review.
+- Checkbox/path changes are saved immediately. Save acknowledgments do not replace newer UI state or clear an in-flight operation.
 - Cmd/Ctrl+R refreshes profiles, Cmd/Ctrl+Enter prepares review, Cmd/Ctrl+Shift+R repeats the last selection. None applies automatically.
 
 ## Module interfaces
@@ -29,4 +32,4 @@ Design and coding follow the requested [GPUI Kit skills](https://github.com/long
 
 ## Deliberate limits
 
-Categories can be staged, with per-setting choices during review. Arbitrary unknown settings, arbitrary MCP servers, and permission-policy edits are not silently generalized beyond the audited schema. Models are private files copied byte-for-byte after review, not interpreted as a fixed Pi schema. Review shows replacement, hidden contents, backup and unchanged-default notices. Runtime compatibility and provider connectivity belong to Pi. Unreadable or invalid source models can be skipped independently of other settings. Packaging, signing, live-device interoperability and assistive-technology validation need real platform evidence.
+Built-in categories retain audited per-setting choices. Custom file/folder paths are relative to the configured Pi directory and reviewed as whole-file copies. Standalone permission policies carry an explicit warning; embedded permission fields and unknown MCP/settings fields remain outside the audited merger. There is no semantic policy-weakening analysis. Authentication/credential paths, hidden paths, symlinks, nested repositories and cross-platform filename collisions fail closed. Models are private files copied byte-for-byte after review, not interpreted as a fixed Pi schema. Review shows replacement, hidden contents, backup and unchanged-default notices. Runtime compatibility and provider connectivity belong to Pi. Unreadable or invalid source models can be skipped independently of other settings. Packaging, signing, live-device interoperability and assistive-technology validation need real platform evidence.

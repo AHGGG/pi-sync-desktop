@@ -14,7 +14,7 @@ The OS application-config directory for `pi-sync-desktop` contains:
 
 - `profiles.json`: names, host/user/port/key path, and Pi directory. No credential values.
 - `known_hosts`: accepted host identities, not authentication credentials.
-- `last-selection.json`: source/destination identifiers and selected configuration categories. No values, secrets, plans or remembered conflict decisions.
+- `last-selection.json`: source/destination identifiers and selected configuration categories and custom relative paths. No values, secrets, plans or remembered conflict decisions.
 
 Plans, source configuration and model content remain in memory. A private temporary directory contains only the application's bundled JavaScript worker source, never device files. The directory is removed on normal shutdown.
 
@@ -32,4 +32,8 @@ The audited allowlist excludes device IDs, shell commands/paths, defaultProvider
 
 Private models can include authentication data. They travel through private process pipes and SSH, not GitHub or the review UI. Review exposes hashes and warnings rather than their content. The public source downloads only allowlisted JSON files from one fixed repository at a verified commit identifier.
 
-Permission-policy synchronization is unavailable until a separate schema, weakening analysis and explicit policy review are implemented. Existing policies remain unchanged.
+Standalone permission files can be explicitly selected as custom paths. Review labels policy changes as potentially granting/removing tool access, shows content (or hidden-content notice and SHA-256), and requires an explicit Source/Target/Skip decision followed by final confirmation. Policies embedded in built-in settings remain unchanged. This is whole-file replacement, not semantic policy validation or weakening analysis.
+
+Custom files are limited to the configured Pi directory and preserve target-only files. Both recursive source and target inventories are captured and revalidated, including directory entries. Symlinks, Git repositories (including nested target repositories), authentication/credential names, dot-paths, nonportable Windows characters, and case/Unicode-normalized aliases are rejected. Protected descendants cause a visible blocker, not silent exclusion. Whole-file copies can contain executable extension code or private data; binary/sensitive content is hidden and text previews are truncated. Hashes identify the complete bytes being approved. No detection heuristic can guarantee that arbitrary selected files are free of secrets.
+
+Custom recovery bytes use hashed flat backup filenames; the backup manifest maps each `path:<relative path>` to its original fingerprint. Files are private to the local process/SSH transfer, never checked into this repository. The private JSON protocol is bounded at 48 MiB; custom content separately permits 256 files, 4 MiB per file, and 8 MiB aggregate. Empty folders and file metadata/executable permissions are not copied.

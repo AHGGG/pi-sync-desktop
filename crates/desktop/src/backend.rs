@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -21,6 +21,8 @@ use zeroize::Zeroizing;
 
 const WORKER: &str = include_str!("../../../backend/worker.mjs");
 const PUBLIC_ID: &str = "public-harness";
+// Combined audited documents, models, and custom files share this private protocol envelope.
+const MAX_PROTOCOL_BYTES: usize = 48 * 1024 * 1024;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Selection {
@@ -78,11 +80,11 @@ impl Engine {
                 let mut bytes = Zeroizing::new(Vec::new());
                 // Bounded reads prevent a broken subprocess exhausting the host.
                 let result = (&mut reader)
-                    .take(16 * 1024 * 1024 + 1)
+                    .take((MAX_PROTOCOL_BYTES + 1) as u64)
                     .read_until(b'\n', &mut bytes);
                 match result {
                     Ok(0) | Err(_) => break,
-                    Ok(n) if n > 16 * 1024 * 1024 => {
+                    Ok(n) if n > MAX_PROTOCOL_BYTES => {
                         let _ = tx.send(Err(()));
                         break;
                     }
@@ -122,6 +124,10 @@ impl Engine {
     }
     fn send(&mut self, value: &Value) -> Result<()> {
         let mut bytes = Zeroizing::new(serde_json::to_vec(value)?);
+        ensure!(
+            bytes.len() <= MAX_PROTOCOL_BYTES,
+            "Sync request exceeds the safe protocol size limit"
+        );
         bytes.push(b'\n');
         self.input.write_all(&bytes)?;
         self.input.flush()?;
@@ -197,7 +203,7 @@ pub(crate) fn start() -> (Sender<Command>, Receiver<Event>) {
             changes: HashMap::new(),
             request: 0,
         };
-        state.snapshot.source_id = Some(PUBLIC_ID.into());
+        state.restore_startup_selection();
         state.publish();
         loop {
             let command = match state
@@ -227,6 +233,7 @@ impl Backend {
                 address: "AHGGG/my-pi-harness · latest public preset".into(),
                 status: "Read-only source".into(),
                 is_local: false,
+                platform: "public".into(),
             },
             Device {
                 id: "local".into(),
@@ -234,6 +241,7 @@ impl Backend {
                 address: local_root(),
                 status: "Local".into(),
                 is_local: true,
+                platform: std::env::consts::OS.into(),
             },
         ];
         self.snapshot.devices.extend(self.profiles.iter().map(|p| {
@@ -244,13 +252,16 @@ impl Backend {
                     "{}@{}:{}",
                     p.connection.username, p.connection.host, p.connection.port
                 ),
-                status: if self.sessions.contains_key(&p.id) {
+                status: if self.connection_errors.contains_key(&p.id) {
+                    "Connection failed"
+                } else if self.sessions.contains_key(&p.id) {
                     "Connected"
                 } else {
                     "Not checked"
                 }
                 .into(),
                 is_local: false,
+                platform: "ssh".into(),
             }
         }));
         self.snapshot.items = vec![
@@ -261,7 +272,18 @@ impl Backend {
         if self.snapshot.source_id.as_deref() != Some(PUBLIC_ID) {
             self.snapshot.items.push(ConfigItem { id: "models".into(), name: "Private model definitions".into(), category: "Private · device to device".into(), detail: "Copy the entire models.json file. Private values stay hidden; the previous file is backed up.".into() });
         }
-        self.snapshot.has_last_selection = self.last.is_some();
+        for id in &self.snapshot.selected_item_ids {
+            if let Some(path) = id.strip_prefix("path:") {
+                self.snapshot.items.push(ConfigItem {
+                    id: id.clone(), name: path.into(), category: "Files & folders".into(),
+                    detail: "Relative to the selected Pi directory. Previous files are backed up before replacement.".into(),
+                });
+            }
+        }
+        self.snapshot.has_last_selection = self
+            .last
+            .as_ref()
+            .is_some_and(|selection| !selection.items.is_empty() && !selection.targets.is_empty());
         let _ = self.events.send(Event::Snapshot(self.snapshot.clone()));
     }
     fn invalidate(&mut self) {
@@ -278,6 +300,7 @@ impl Backend {
         match command {
             Command::Refresh => {
                 self.invalidate();
+                self.snapshot.blocked_targets.clear();
                 self.publish();
             }
             Command::AddDevice {
@@ -286,6 +309,11 @@ impl Backend {
                 root,
             } => {
                 let connection = ConnectionConfig::parse(&ssh_line)?;
+                let root = if root.trim().is_empty() {
+                    "~/.pi/agent".to_owned()
+                } else {
+                    root.trim().to_owned()
+                };
                 ensure!(
                     !self
                         .profiles
@@ -304,11 +332,7 @@ impl Backend {
                     id,
                     name: name.trim().to_owned(),
                     connection,
-                    agent_dir: if root.trim().is_empty() {
-                        "~/.pi/agent".into()
-                    } else {
-                        root.trim().into()
-                    },
+                    agent_dir: root,
                 };
                 let mut profiles = self.profiles.clone();
                 profiles.push(profile);
@@ -331,16 +355,37 @@ impl Backend {
                 self.store.save(&profiles)?;
                 self.profiles = profiles;
                 self.sessions.remove(&id);
+                self.connection_errors.remove(&id);
+                self.snapshot.target_ids.retain(|target| target != &id);
                 if self.snapshot.source_id.as_ref() == Some(&id) {
-                    self.snapshot.source_id = Some(PUBLIC_ID.into());
+                    self.snapshot.source_id = Some("local".into());
+                    self.snapshot.selected_item_ids.clear();
+                    self.snapshot.target_ids.retain(|target| target != "local");
                 }
                 self.invalidate();
+                self.snapshot.blocked_targets.clear();
+                self.save_selection(Selection {
+                    source: self.snapshot.source_id.clone().unwrap_or_else(|| "local".into()),
+                    targets: self.snapshot.target_ids.clone(),
+                    items: self.snapshot.selected_item_ids.clone(),
+                }).context("The device was removed, but the updated selection could not be saved. Save your selection again")?;
                 self.publish();
             }
             Command::SelectSource(id) => {
                 self.source(&id)?;
-                self.snapshot.source_id = Some(id);
+                self.save_selection(Selection {
+                    source: id.clone(),
+                    targets: self
+                        .snapshot
+                        .target_ids
+                        .iter()
+                        .filter(|target| *target != &id)
+                        .cloned()
+                        .collect(),
+                    items: vec![],
+                })?;
                 self.invalidate();
+                self.snapshot.blocked_targets.clear();
                 self.publish();
             }
             Command::Prepare {
@@ -352,6 +397,35 @@ impl Backend {
                 targets,
                 items,
             })?,
+            Command::SaveSelection {
+                source,
+                targets,
+                items,
+            } => {
+                self.save_selection(Selection {
+                    source,
+                    targets,
+                    items,
+                })?;
+                self.invalidate();
+                let has_last_selection = self.last.as_ref().is_some_and(|selection| {
+                    !selection.items.is_empty() && !selection.targets.is_empty()
+                });
+                self.snapshot.has_last_selection = has_last_selection;
+                let _ = self
+                    .events
+                    .send(Event::SelectionSaved { has_last_selection });
+            }
+            Command::CancelReview => {
+                let plan_id = self.snapshot.plan_id.clone();
+                self.invalidate();
+                self.snapshot.results.clear();
+                self.snapshot.blocked_targets.clear();
+                if let Some(plan_id) = plan_id {
+                    self.call(json!({"op":"discard","planId":plan_id}))?;
+                }
+                self.publish();
+            }
             Command::RepeatLast => {
                 let selection = self
                     .last
@@ -395,9 +469,59 @@ impl Backend {
             self.target(id)
         }
     }
+    fn restore_startup_selection(&mut self) {
+        self.snapshot.source_id = Some("local".into());
+        if let Some(mut saved) = self.last.clone() {
+            if self.source(&saved.source).is_err() {
+                saved.source = "local".into();
+                saved.items.clear();
+            }
+            saved
+                .targets
+                .retain(|id| id != &saved.source && self.target(id).is_ok());
+            if self.validate_selection(&saved).is_ok() {
+                self.snapshot.source_id = Some(saved.source.clone());
+                self.snapshot.selected_item_ids = saved.items.clone();
+                self.snapshot.target_ids = saved.targets.clone();
+                self.last = Some(saved);
+            } else {
+                self.last = None;
+            }
+        }
+        self.snapshot.selection_loaded = true;
+    }
+    fn validate_selection(&self, selection: &Selection) -> Result<()> {
+        validate_selection_shape(selection)?;
+        self.source(&selection.source)?;
+        for id in &selection.targets {
+            self.target(id)?;
+        }
+        Ok(())
+    }
+    fn save_selection(&mut self, selection: Selection) -> Result<()> {
+        self.validate_selection(&selection)?;
+        write_selection(&self.config_dir.join("last-selection.json"), &selection).context(
+            "The selection could not be saved. Your previous saved selection is unchanged",
+        )?;
+        self.snapshot.source_id = Some(selection.source.clone());
+        self.snapshot.selected_item_ids = selection.items.clone();
+        self.snapshot.target_ids = selection.targets.clone();
+        self.last = Some(selection);
+        Ok(())
+    }
     fn prepare(&mut self, selection: Selection) -> Result<()> {
+        self.validate_selection(&selection)?;
+        ensure!(
+            !selection.items.is_empty(),
+            "Choose at least one item to review"
+        );
+        ensure!(
+            !selection.targets.is_empty(),
+            "Choose at least one target device"
+        );
         self.invalidate();
         self.snapshot.results.clear();
+        self.snapshot.blocked_targets.clear();
         self.connection_errors.clear();
         self.snapshot.source_id = Some(selection.source.clone());
         self.busy("Reading source and preparing changes…");
@@ -410,14 +534,8 @@ impl Backend {
         let result = self.call(
             json!({"op":"preview","source":source,"targets":targets,"items":selection.items}),
         )?;
-        self.snapshot.selected_item_ids = selection.items.clone();
-        self.snapshot.target_ids = selection.targets.clone();
-        self.selection = Some(selection.clone());
-        self.last = Some(selection);
-        write_selection(
-            &self.config_dir.join("last-selection.json"),
-            self.last.as_ref().unwrap(),
-        )?;
+        self.save_selection(selection.clone())?;
+        self.selection = Some(selection);
         self.set_plan(result)?;
         self.publish();
         Ok(())
@@ -429,6 +547,7 @@ impl Backend {
             .map(str::to_owned);
         self.snapshot.changes.clear();
         self.snapshot.results.clear();
+        self.snapshot.blocked_targets.clear();
         self.snapshot.command_details_reviewed = result["commandDetailsRevealed"] == true;
         self.changes.clear();
         for target in result
@@ -443,7 +562,7 @@ impl Backend {
             let name = self.device_name(&id);
             let status = target["status"].as_str().unwrap_or("blocked");
             if status == "blocked" {
-                self.snapshot.results.push((
+                self.snapshot.blocked_targets.push((
                     name.clone(),
                     self.connection_errors.get(&id).cloned().unwrap_or_else(|| {
                         explain(target["error"].as_str().unwrap_or("TARGET_FAILED"))
@@ -482,6 +601,24 @@ impl Backend {
                             }
                         }
                     }
+                }
+            }
+            if let Some(files) = target["files"].as_array() {
+                for file in files {
+                    if file["changed"] != true && !file["error"].is_string() {
+                        continue;
+                    }
+                    let path = file["path"].as_str().context("Invalid file review path")?;
+                    let change_id = format!("{id}:files:{path}");
+                    self.snapshot.changes.push(Change {
+                        id: change_id.clone(), device: name.clone(), path: path.into(),
+                        before: custom_file_preview(&file["before"], file["targetHash"].as_str()),
+                        after: file["error"].as_str().map(explain).unwrap_or_else(|| format!("{}Whole-file copy. Extension code may execute; permission policies may change tool access. Inspect content before using source.\n\n{}", if file["warning"] == "PERMISSION_POLICY_CHANGE" { "PERMISSION POLICY CHANGE: This standalone policy may grant or remove tool access.\n\n" } else { "" }, custom_file_preview(&file["after"], file["sourceHash"].as_str()))),
+                        conflict: true,
+                        source_available: file["sourceAvailable"] != false && !file["error"].is_string(),
+                    });
+                    self.changes
+                        .insert(change_id, (id.clone(), "files".into(), path.into()));
                 }
             }
             if target["models"]["changed"] == true {
@@ -537,6 +674,7 @@ impl Backend {
         );
         let mut resolutions = json!({});
         let mut model_choices = json!({});
+        let mut file_choices = json!({});
         for (id, choice) in choices {
             let (target, document, path) =
                 self.changes.get(&id).context("Unknown review choice")?;
@@ -545,7 +683,9 @@ impl Backend {
                 Choice::Target => "target",
                 Choice::Skip => "skip",
             };
-            if document == "models" {
+            if document == "files" {
+                file_choices[target][path] = json!(choice);
+            } else if document == "models" {
                 model_choices[target] = json!(choice);
             } else {
                 resolutions[target][document][path] = json!(choice);
@@ -553,7 +693,7 @@ impl Backend {
         }
         self.busy("Applying the changes you reviewed…");
         // Resolve against captured snapshots, never silently obtain a new preview.
-        let resolved = self.call(json!({"op":"resolve","planId":plan_id,"resolutions":resolutions,"modelChoices":model_choices}))?;
+        let resolved = self.call(json!({"op":"resolve","planId":plan_id,"resolutions":resolutions,"modelChoices":model_choices,"fileChoices":file_choices}))?;
         let ready = resolved["targets"]
             .as_array()
             .context("Invalid resolved plan")?
@@ -586,6 +726,7 @@ impl Backend {
         let result =
             self.call(json!({"op":"apply","planId":new_plan,"approved":true,"targetIds":ready,"commandReviewApproved":self.snapshot.command_details_reviewed}))?;
         self.invalidate();
+        self.snapshot.blocked_targets = blocked.clone();
         self.snapshot.results = blocked;
         for target in result["targets"]
             .as_array()
@@ -614,6 +755,11 @@ impl Backend {
             }
             if let Some(path) = target["backupPath"].as_str() {
                 status.push_str(&format!(" · Backup: {path}"));
+            }
+            if !matches!(target["status"].as_str(), Some("applied" | "unchanged")) {
+                self.snapshot
+                    .blocked_targets
+                    .push((self.device_name(id), status.clone()));
             }
             self.snapshot.results.push((self.device_name(id), status));
         }
@@ -667,7 +813,7 @@ impl Backend {
                     }
                     Err(error) => {
                         self.connection_errors
-                            .insert(target_id.clone(), error.to_string());
+                            .insert(target_id.clone(), safe_connection_error(&error));
                         json!({"op":"transport-result","transportId":value["transportId"],"error":"SSH_FAILED"})
                     }
                 };
@@ -770,8 +916,36 @@ impl Backend {
         AuthAnswer::Cancel
     }
 }
+fn safe_connection_error(error: &anyhow::Error) -> String {
+    let text = error.to_string();
+    match text.as_str() {
+        "Host key changed. Connection blocked; verify the server independently"
+        | "Host identity was not accepted"
+        | "Cannot verify host identity"
+        | "Authentication cancelled"
+        | "SSH key authentication failed"
+        | "SSH password authentication failed"
+        | "SSH authentication failed"
+        | "Cannot resolve SSH host"
+        | "Cannot connect to SSH host"
+        | "SSH handshake failed"
+        | "Cannot start remote Node worker"
+        | "Cannot open SSH worker channel"
+        | "Cannot send remote request"
+        | "Cannot read remote worker response"
+        | "Remote request exceeds size limit" => text,
+        _ => explain("SSH_FAILED"),
+    }
+}
 fn local_root() -> String {
     std::env::var("PI_CODING_AGENT_DIR").unwrap_or_else(|_| "~/.pi/agent".into())
+}
+fn custom_file_preview(content: &Value, hash: Option<&str>) -> String {
+    let content = content.as_str().unwrap_or("Not present");
+    match hash {
+        Some(hash) => format!("SHA256 {hash}\n\n{content}"),
+        None => content.into(),
+    }
 }
 fn model_target_preview(hash: Option<&str>, inspected: bool) -> String {
     if !inspected {
@@ -809,6 +983,15 @@ fn display_value(value: &Value) -> String {
 }
 fn explain(code: &str) -> String {
     match code {
+        "SOURCE_CUSTOM_PATH_MISSING" => "The selected source file or folder was not found. Check its path and review again",
+        "PROTECTED_CUSTOM_PATH" => "Authentication and credential files cannot be synced",
+        "AUDITED_DOCUMENT_REQUIRED" => "Use the built-in configuration item to review this file safely",
+        "INVALID_CUSTOM_PATH" => "Choose a relative file or folder inside the Pi directory",
+        "PUBLIC_CUSTOM_PATHS_FORBIDDEN" => "Custom files require a device source",
+        "CUSTOM_PATH_COLLISION" => "Selected paths collide on another platform (case or Unicode spelling). Rename them before syncing",
+        "CUSTOM_SELECTION_TOO_LARGE" => "Choose a smaller folder or fewer files: custom sync allows 256 files, 4 MiB per file, 8 MiB total and 32 folder levels",
+        "CUSTOM_PATH_CHANGED" | "CONCURRENT_UPDATE" => "A selected file changed during sync. Inspect the results and prepare a fresh review",
+        "INVALID_CUSTOM_SELECTION" => "The selected file paths are invalid. Choose paths relative to the Pi directory",
         "SOURCE_MODELS_INVALID_JSON" => {
             "The source models.json is not valid JSON and cannot be copied"
         }
@@ -852,9 +1035,115 @@ fn explain(code: &str) -> String {
         "PUBLIC_FETCH_FAILED" | "PUBLIC_SOURCE_UNAVAILABLE" => {
             "Cannot fetch the public harness. Check the connection and try again"
         }
-        _ => return format!("Sync blocked: {code}"),
+        _ => "Sync could not continue safely. Check the selected paths and device connection, then review again",
     }
     .into()
+}
+fn validate_selection_shape(selection: &Selection) -> Result<()> {
+    let valid_id = |id: &str| {
+        !id.is_empty()
+            && id.len() <= 60
+            && id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+    };
+    ensure!(valid_id(&selection.source), "Invalid source device");
+    ensure!(
+        selection.targets.len() <= 100 && selection.items.len() <= 256,
+        "Selection exceeds the safe size limit"
+    );
+    let mut targets = HashSet::new();
+    for id in &selection.targets {
+        ensure!(
+            valid_id(id) && id != PUBLIC_ID && id != &selection.source && targets.insert(id),
+            "Invalid or duplicate target device"
+        );
+    }
+    let mut items = HashSet::new();
+    for item in &selection.items {
+        ensure!(items.insert(item), "Duplicate sync item");
+        if matches!(item.as_str(), "settings" | "subagents" | "mcp" | "models") {
+            ensure!(
+                selection.source != PUBLIC_ID || item != "models",
+                "Private models require a device source"
+            );
+            continue;
+        }
+        let path = item.strip_prefix("path:").context("Unknown sync item")?;
+        ensure!(
+            selection.source != PUBLIC_ID,
+            "Custom files require a device source"
+        );
+        ensure!(
+            !path.is_empty()
+                && path.len() <= 1024
+                && !path.chars().any(char::is_control)
+                && !path.contains(['\\', ':', '?', '*', '<', '>', '|', '"'])
+                && path
+                    .split('/')
+                    .all(|part| !part.is_empty() && !part.starts_with('.')),
+            "Choose a relative file or folder inside the Pi directory, without hidden folders or parent traversal"
+        );
+        ensure!(
+            !matches!(
+                path.split('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "settings.json" | "mcp.json" | "subagents.json" | "models.json"
+            ),
+            "Use the built-in configuration item to review this file safely"
+        );
+        for part in path.split('/') {
+            let lower = part.to_ascii_lowercase();
+            let stem = lower.split('.').next().unwrap_or("");
+            ensure!(
+                !matches!(lower.as_str(), "__proto__" | "prototype" | "constructor")
+                    && !lower.ends_with(['.', ' '])
+                    && !matches!(stem, "con" | "prn" | "aux" | "nul")
+                    && !(stem.len() == 4
+                        && (stem.starts_with("com") || stem.starts_with("lpt"))
+                        && matches!(stem.as_bytes()[3], b'1'..=b'9')),
+                "This file name is not portable between devices"
+            );
+            let words = lower.split(['.', '_', '-']).collect::<Vec<_>>();
+            let protected = ["credential", "password", "secret"]
+                .iter()
+                .any(|term| lower.contains(*term))
+                || words.iter().any(|word| {
+                    matches!(
+                        *word,
+                        "credential"
+                            | "credentials"
+                            | "secret"
+                            | "secrets"
+                            | "token"
+                            | "tokens"
+                            | "oauth"
+                            | "authentication"
+                            | "authorization"
+                    )
+                })
+                || matches!(words[0], "auth" | "password" | "passwords")
+                || matches!(
+                    lower.as_str(),
+                    "id_rsa" | "id_ed25519" | "id_ecdsa" | "known_hosts" | "authorized_keys"
+                )
+                || [".pem", ".key", ".p12", ".pfx", ".env"]
+                    .iter()
+                    .any(|ext| lower.ends_with(*ext));
+            ensure!(
+                !protected,
+                "Authentication and credential files cannot be selected"
+            );
+        }
+    }
+    ensure!(
+        serde_json::to_vec(selection)?.len() < 64 * 1024,
+        "Selection exceeds the safe size limit"
+    );
+    Ok(())
 }
 fn read_selection(path: &Path) -> Result<Option<Selection>> {
     let metadata = match fs::symlink_metadata(path) {
@@ -866,9 +1155,12 @@ fn read_selection(path: &Path) -> Result<Option<Selection>> {
         metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() < 64 * 1024,
         "Invalid saved selection"
     );
-    Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+    let selection = serde_json::from_slice(&fs::read(path)?)?;
+    validate_selection_shape(&selection)?;
+    Ok(Some(selection))
 }
 fn write_selection(path: &Path, selection: &Selection) -> Result<()> {
+    validate_selection_shape(selection)?;
     let parent = path.parent().context("Missing config directory")?;
     fs::create_dir_all(parent)?;
     ensure!(
@@ -890,6 +1182,275 @@ fn write_selection(path: &Path, selection: &Selection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_backend(dir: &Path) -> Backend {
+        let (_, commands) = mpsc::channel();
+        let (events, _) = mpsc::channel();
+        Backend {
+            commands,
+            events,
+            pending: VecDeque::new(),
+            engine: None,
+            profiles: vec![],
+            store: ProfileStore::new(dir.join("profiles.json")),
+            config_dir: dir.to_owned(),
+            sessions: HashMap::new(),
+            connection_errors: HashMap::new(),
+            snapshot: Snapshot::default(),
+            last: None,
+            selection: None,
+            plan: None,
+            changes: HashMap::new(),
+            request: 0,
+        }
+    }
+    #[test]
+    fn startup_defaults_local_and_restores_saved_custom_scope_without_a_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = test_backend(dir.path());
+        backend.restore_startup_selection();
+        assert_eq!(backend.snapshot.source_id.as_deref(), Some("local"));
+        assert!(backend.snapshot.selection_loaded);
+        backend.last = Some(Selection {
+            source: "local".into(),
+            targets: vec!["removed-device".into()],
+            items: vec!["path:extensions".into(), "path:permissions.json".into()],
+        });
+        backend.restore_startup_selection();
+        backend.publish();
+        assert!(backend.snapshot.target_ids.is_empty());
+        assert_eq!(backend.snapshot.selected_item_ids.len(), 2);
+        assert!(
+            backend
+                .snapshot
+                .items
+                .iter()
+                .any(|item| item.id == "path:extensions")
+        );
+        assert!(backend.snapshot.plan_id.is_none());
+        backend.snapshot.selected_item_ids = vec!["subagents".into()];
+        backend.handle(Command::Refresh).unwrap();
+        assert_eq!(backend.snapshot.selected_item_ids, vec!["subagents"]);
+    }
+    #[test]
+    fn save_selection_does_not_prepare_or_apply_and_invalid_save_preserves_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = test_backend(dir.path());
+        backend
+            .handle(Command::SaveSelection {
+                source: "local".into(),
+                targets: vec![],
+                items: vec!["path:extensions".into()],
+            })
+            .unwrap();
+        assert!(backend.engine.is_none());
+        assert!(backend.snapshot.plan_id.is_none());
+        let path = dir.path().join("last-selection.json");
+        let before = fs::read(&path).unwrap();
+        assert!(
+            backend
+                .handle(Command::SaveSelection {
+                    source: "local".into(),
+                    targets: vec![],
+                    items: vec!["path:../escape".into()]
+                })
+                .is_err()
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+    #[test]
+    fn save_acknowledgements_cannot_replace_newer_ui_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = test_backend(dir.path());
+        let (tx, events) = mpsc::channel();
+        backend.events = tx;
+        backend
+            .handle(Command::SaveSelection {
+                source: "local".into(),
+                targets: vec![],
+                items: vec![],
+            })
+            .unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            Event::SelectionSaved {
+                has_last_selection: false
+            }
+        ));
+        assert!(events.try_recv().is_err());
+    }
+    #[test]
+    fn source_change_is_saved_and_default_device_roots_are_deduplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = test_backend(dir.path());
+        backend
+            .handle(Command::AddDevice {
+                name: "Test".into(),
+                ssh_line: "ssh user@host".into(),
+                root: "".into(),
+            })
+            .unwrap();
+        assert!(
+            backend
+                .handle(Command::AddDevice {
+                    name: "Duplicate".into(),
+                    ssh_line: "ssh user@host".into(),
+                    root: "  ~/.pi/agent  ".into()
+                })
+                .is_err()
+        );
+        let source = backend.profiles[0].id.clone();
+        backend.snapshot.target_ids = vec![source.clone(), "local".into()];
+        backend.snapshot.selected_item_ids = vec!["settings".into()];
+        backend
+            .handle(Command::SelectSource(source.clone()))
+            .unwrap();
+        let saved = read_selection(&dir.path().join("last-selection.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.source, source);
+        assert_eq!(saved.targets, vec!["local"]);
+        assert!(saved.items.is_empty());
+        assert!(!backend.snapshot.has_last_selection);
+    }
+    #[test]
+    fn removing_devices_persists_remaining_scope_and_resets_removed_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = test_backend(dir.path());
+        for (name, ssh) in [("First", "ssh user@first"), ("Second", "ssh user@second")] {
+            backend
+                .handle(Command::AddDevice {
+                    name: name.into(),
+                    ssh_line: ssh.into(),
+                    root: "".into(),
+                })
+                .unwrap();
+        }
+        let first = backend.profiles[0].id.clone();
+        let second = backend.profiles[1].id.clone();
+        backend
+            .save_selection(Selection {
+                source: "local".into(),
+                targets: vec![first.clone(), second.clone()],
+                items: vec!["path:extensions".into()],
+            })
+            .unwrap();
+        backend.handle(Command::RemoveDevice(first)).unwrap();
+        let saved = read_selection(&dir.path().join("last-selection.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.targets, vec![second.clone()]);
+        assert_eq!(saved.items, vec!["path:extensions"]);
+        backend
+            .save_selection(Selection {
+                source: second.clone(),
+                targets: vec!["local".into()],
+                items: vec!["path:remote-only".into()],
+            })
+            .unwrap();
+        backend.handle(Command::RemoveDevice(second)).unwrap();
+        let saved = read_selection(&dir.path().join("last-selection.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.source, "local");
+        assert!(saved.targets.is_empty());
+        assert!(saved.items.is_empty());
+        assert!(!backend.snapshot.has_last_selection);
+    }
+    #[test]
+    fn rapid_saves_are_fifo_and_empty_selection_is_persistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = test_backend(dir.path());
+        for items in [
+            vec!["settings".into()],
+            vec!["path:extensions".into()],
+            vec![],
+        ] {
+            backend
+                .handle(Command::SaveSelection {
+                    source: "local".into(),
+                    targets: vec![],
+                    items,
+                })
+                .unwrap();
+        }
+        let saved = read_selection(&dir.path().join("last-selection.json"))
+            .unwrap()
+            .unwrap();
+        assert!(saved.items.is_empty());
+        assert!(saved.targets.is_empty());
+        backend.last = Some(saved);
+        backend.restore_startup_selection();
+        assert!(backend.snapshot.selected_item_ids.is_empty());
+        assert!(backend.snapshot.target_ids.is_empty());
+    }
+    #[test]
+    fn invalid_custom_selections_are_rejected_but_permission_files_are_explicitly_allowed() {
+        let mut selection = Selection {
+            source: "local".into(),
+            targets: vec![],
+            items: vec![],
+        };
+        for path in [
+            "",
+            "../escape",
+            "/absolute",
+            "x/./a",
+            "x/../a",
+            ".ssh",
+            "x//a",
+            "x/",
+            "C:/x",
+            "auth.json",
+            "settings.json",
+            "mcp.json",
+            "private.pem",
+        ] {
+            selection.items = vec![format!("path:{path}")];
+            assert!(
+                validate_selection_shape(&selection).is_err(),
+                "accepted {path}"
+            );
+        }
+        selection.items = vec!["path:permissions.json".into(), "path:extensions".into()];
+        assert!(validate_selection_shape(&selection).is_ok());
+        selection.source = PUBLIC_ID.into();
+        assert!(validate_selection_shape(&selection).is_err());
+    }
+    #[test]
+    fn file_reviews_require_explicit_decision_and_failed_targets_are_not_zero_diffs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = test_backend(dir.path());
+        backend.set_plan(json!({"planId":"files-plan","targets":[
+            {"id":"local","status":"conflicts","files":[{"path":"extensions/example.ts","changed":true,"sourceAvailable":true,"before":"old","after":"new","warning":"PERMISSION_POLICY_CHANGE"}]},
+            {"id":"offline","status":"blocked","error":"SSH_FAILED"}
+        ]})).unwrap();
+        assert_eq!(backend.snapshot.blocked_targets.len(), 1);
+        assert_eq!(backend.snapshot.unresolved_count(&BTreeMap::new()), 1);
+        assert!(
+            backend.snapshot.changes[0]
+                .after
+                .contains("permission policies")
+        );
+        assert_eq!(
+            backend.changes["local:files:extensions/example.ts"].1,
+            "files"
+        );
+        backend.invalidate();
+        assert!(backend.apply("files-plan".into(), BTreeMap::new()).is_err());
+        assert!(backend.engine.is_none());
+    }
+    #[test]
+    fn hidden_file_reviews_still_identify_exact_bytes() {
+        let preview =
+            custom_file_preview(&json!("[Sensitive content hidden]"), Some("reviewed-hash"));
+        assert!(preview.contains("SHA256 reviewed-hash"));
+        assert!(preview.contains("[Sensitive content hidden]"));
+        assert_eq!(custom_file_preview(&Value::Null, None), "Not present");
+    }
+    #[test]
+    fn unknown_error_never_displays_remote_content() {
+        assert!(!explain("secret remote stderr").contains("secret remote stderr"));
+    }
     #[test]
     fn remembers_selection_not_secrets_or_plan() {
         let dir = tempfile::tempdir().unwrap();

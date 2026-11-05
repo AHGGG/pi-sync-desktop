@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import { latestPublic } from "./public-source.mjs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { handle, decodeModels } from "./worker.mjs";
+import { handle, decodeModels, validateRelativePath, validatePathCollisions } from "./worker.mjs";
 import { SCHEMAS, validateDocument, mergeDocuments } from "./documents.mjs";
 import { cell, object, same } from "./merge.mjs";
 const fail = (code) => {
@@ -55,6 +55,34 @@ function project(name, value, fields) {
   validateDocument(name, result);
   return result;
 }
+function fileDisplay(record) {
+  if (!record) return null;
+  const bytes = Buffer.from(record.base64, 'base64');
+  try {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    if (/[\x00-\x08\x0e-\x1f]/.test(text)) return '[Binary file: content hidden]';
+    // Private protocol only. Credentials and command strings are never exposed implicitly.
+    if (/(?:bearer\s|sk-[A-Za-z0-9]|(?:api[_-]?key|token|password|secret|authorization|credential)\s*["']?\s*[:=]|https?:\/\/[^/\s]*@|["']?(?:command|args)["']?\s*[:=])/i.test(text)) return '[Sensitive content hidden]';
+    return text.slice(0, 12000) + (text.length > 12000 ? '\n[Truncated]' : '');
+  } catch { return '[Binary file: content hidden]'; }
+}
+function reviewFiles(source, target, choices = {}) {
+  const names = [...new Set([...Object.keys(source), ...Object.keys(target)])].sort();
+  validatePathCollisions(names, true);
+  if (!object(choices) || Object.entries(choices).some(([rel, choice]) => !names.includes(rel) || !['source', 'target', 'skip'].includes(choice))) fail('INVALID_FILE_CHOICE');
+  return names.map(rel => {
+    const src = Object.hasOwn(source, rel) ? source[rel] : undefined;
+    const dst = Object.hasOwn(target, rel) ? target[rel] : undefined;
+    const choice = Object.hasOwn(choices, rel) ? choices[rel] : undefined;
+    const differs = !!src && src.hash !== (dst?.hash ?? null);
+    const sensitive = /permission|policy|policies/i.test(rel);
+    return { path: rel, sourceHash: src?.hash ?? null, targetHash: dst?.hash ?? null,
+      changed: differs && choice !== 'target' && choice !== 'skip',
+      conflict: differs && choice === undefined, sourceAvailable: !!src,
+      before: fileDisplay(dst), after: fileDisplay(src), sensitive,
+      ...(sensitive ? { warning: 'PERMISSION_POLICY_CHANGE' } : {}), ...(choice ? { choice } : {}) };
+  });
+}
 export class SyncEngine {
   #plans = new Map();
   constructor(remote) {
@@ -70,11 +98,14 @@ export class SyncEngine {
     );
   }
   async source(input) {
-    const documents = input.items.filter((k) => k !== "models"),
+    const documents = input.items.filter((k) => k !== "models" && !k.startsWith("path:")),
       values = {},
       fingerprints = {};
     let models, modelError;
+    let customFiles = {}, customDirectories = [];
+    const paths = input.items.filter(k => k.startsWith("path:")).map(k => validateRelativePath(k.slice(5)));
     if (input.source.type === "public") {
+      if (paths.length) fail("PUBLIC_CUSTOM_PATHS_FORBIDDEN");
       if (input.items.includes("models")) fail("PUBLIC_MODELS_FORBIDDEN");
       if (input.source.latest === true) {
         const latest = await latestPublic(documents);
@@ -99,13 +130,18 @@ export class SyncEngine {
       }
     } else {
       const source = target(input.source);
-      const snapshot = documents.length
+      const snapshot = documents.length || paths.length
         ? await this.call(source, {
             op: "snapshot",
             documents,
             includeModels: false,
+            paths, requirePaths: true,
           })
         : {};
+      customFiles = snapshot.customFiles ?? {};
+      customDirectories = snapshot.customDirectories ?? [];
+      if (paths.length) fingerprints.customDirectories = customDirectories;
+      if (paths.length) fingerprints.customFiles = Object.fromEntries(Object.entries(customFiles).map(([rel, r]) => [rel, r.hash]));
       for (const name of documents) {
         values[name] = project(
           name,
@@ -148,7 +184,7 @@ export class SyncEngine {
     // MCP activation is opt-in; settings-only must not enable the extension.
     if (values.settings && !input.items.includes("mcp"))
       delete values.settings.extensions;
-    return { values, fingerprints, models, modelError };
+    return { values, fingerprints, models, modelError, customFiles, customDirectories };
   }
   async preview(input) {
     if (
@@ -158,7 +194,7 @@ export class SyncEngine {
       !input.items.length ||
       new Set(input.items).size !== input.items.length ||
       input.items.some(
-        (k) => !["settings", "mcp", "subagents", "models"].includes(k),
+        (k) => typeof k !== "string" || (!["settings", "mcp", "subagents", "models"].includes(k) && !k.startsWith("path:")),
       )
     )
       fail("INVALID_SELECTION");
@@ -212,6 +248,7 @@ export class SyncEngine {
           op: "snapshot",
           documents: Object.keys(source.values),
           includeModels: !!source.models,
+          paths: input.items.filter(k => k.startsWith("path:")).map(k => k.slice(5)),
         });
         const merged = mergeDocuments(
           source.values,
@@ -240,13 +277,17 @@ export class SyncEngine {
               ],
             }
           : null;
+        validatePathCollisions([...Object.keys(source.customFiles), ...source.customDirectories, ...Object.keys(snapshot.customFiles ?? {}), ...(snapshot.customDirectories ?? [])]);
+        if (Object.keys(source.customFiles).some(rel => (snapshot.customDirectories ?? []).includes(rel)) || Object.keys(snapshot.customFiles ?? {}).some(rel => source.customDirectories.includes(rel))) fail("CUSTOM_PATH_COLLISION");
+        const files = reviewFiles(source.customFiles, snapshot.customFiles ?? {});
         const status =
+          files.some(f => f.conflict) ||
           Object.values(documents).some((d) => d.conflicts.length) ||
           (models?.changed && models.error)
             ? "conflicts"
             : "ready";
-        reviews.push({ id: t.id, status, documents, models });
-        prepared.push({ target: t, snapshot, merged, status, models });
+        reviews.push({ id: t.id, status, documents, models, files });
+        prepared.push({ target: t, snapshot, merged, status, models, files });
       } catch (e) {
         reviews.push({ id: t.id, status: "blocked", error: safeError(e) });
       }
@@ -269,13 +310,14 @@ export class SyncEngine {
         source.fingerprints.revision ?? input.source.revision ?? null,
     };
   }
-  resolve({ planId, resolutions = {}, modelChoices = {} }) {
+  resolve({ planId, resolutions = {}, modelChoices = {}, fileChoices = {} }) {
     const plan = this.#plans.get(planId);
     if (!plan) fail("PLAN_NOT_FOUND");
     if (
       !object(resolutions) ||
       !object(modelChoices) ||
-      [...Object.keys(resolutions), ...Object.keys(modelChoices)].some(
+      !object(fileChoices) ||
+      [...Object.keys(resolutions), ...Object.keys(modelChoices), ...Object.keys(fileChoices)].some(
         (id) => !plan.prepared.some((p) => p.target.id === id),
       )
     )
@@ -286,12 +328,15 @@ export class SyncEngine {
       ...resolutions,
     };
     modelChoices = { ...plan.modelChoices, ...modelChoices };
+    if (Object.values(fileChoices).some(choices => !object(choices))) fail("INVALID_FILE_CHOICE");
+    fileChoices = Object.fromEntries(plan.prepared.map(p => [p.target.id, { ...plan.fileChoices?.[p.target.id], ...fileChoices[p.target.id] }]));
     const prepared = plan.prepared.map((item) => {
       const merged = mergeDocuments(
         plan.source.values,
         { state: { exists: false, value: null }, ...item.snapshot },
         resolutions[item.target.id] ?? plan.input.resolutions?.[item.target.id],
       );
+      const files = reviewFiles(plan.source.customFiles, item.snapshot.customFiles ?? {}, fileChoices[item.target.id]);
       const choice = modelChoices[item.target.id];
       if (
         choice !== undefined &&
@@ -312,7 +357,9 @@ export class SyncEngine {
         ...item,
         merged,
         models,
+        files,
         status:
+          files.some(f => f.conflict) ||
           Object.values(merged.documents).some((d) => d.conflicts.length) ||
           (models?.changed && models.error)
             ? "conflicts"
@@ -326,6 +373,7 @@ export class SyncEngine {
         id: review.id,
         status: item.status,
         models: item.models,
+        files: item.files,
         documents: Object.fromEntries(
           Object.entries(item.merged.documents).map(([n, d]) => [
             n,
@@ -342,6 +390,7 @@ export class SyncEngine {
       reviews,
       resolutions,
       modelChoices,
+      fileChoices,
     });
     return {
       planId: next,
@@ -414,6 +463,10 @@ export class SyncEngine {
           op: "apply",
           expected: hashes(item.snapshot),
           retainOneBackup: true,
+          paths: plan.input.items.filter(k => k.startsWith("path:")).map(k => k.slice(5)),
+          expectedDirectories: item.snapshot.customDirectories,
+          expectedFiles: Object.fromEntries(item.files.map(f => [f.path, f.targetHash])),
+          fileWrites: Object.fromEntries(item.files.filter(f => f.changed).map(f => [f.path, source.customFiles[f.path].base64])),
         };
         if (!item.models?.changed) delete request.expected.models;
         if (Object.keys(item.merged.documents).length)
@@ -433,9 +486,7 @@ export class SyncEngine {
         const applied = Array.isArray(worker?.applied)
           ? worker.applied
               .filter((a) =>
-                ["settings", "mcp", "subagents", "models", "state"].includes(
-                  a?.file,
-                ),
+                ["settings", "mcp", "subagents", "models", "state"].includes(a?.file) || (typeof a?.file === "string" && a.file.startsWith("path:")),
               )
               .map((a) => ({ file: a.file, verified: a.verified === true }))
           : [];

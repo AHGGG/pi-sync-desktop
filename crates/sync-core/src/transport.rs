@@ -195,16 +195,15 @@ impl SshTransport {
         Ok(Self { session })
     }
     pub fn run_worker(&mut self, worker_source: &str, request: &Value) -> Result<Value> {
-        const MAX: usize = 8 * 1024 * 1024;
+        // Keep in sync with backend/worker.mjs MAX_PROTOCOL_BYTES. This bounds the
+        // combined audited documents, models and base64 custom-file envelope.
+        const MAX: usize = 48 * 1024 * 1024;
         // Fixed launcher only; user input and worker source travel solely over stdin.
-        const COMMAND: &str = "node -e \"let s='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>{s+=c;if(s.length>16777216)process.exit(2)});process.stdin.on('end',async()=>{try{let p=JSON.parse(s);let m=await import('data:text/javascript;base64,'+p.code);console.log(JSON.stringify(await m.handle(p.request)))}catch{console.log(JSON.stringify({ok:false,error:{code:'REMOTE_FAILED'}}))}})\"";
+        const COMMAND: &str = "node -e \"let s='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>{s+=c;if(s.length>50331648)process.exit(2)});process.stdin.on('end',async()=>{try{let p=JSON.parse(s);let m=await import('data:text/javascript;base64,'+p.code);console.log(JSON.stringify(await m.handle(p.request)))}catch{console.log(JSON.stringify({ok:false,error:{code:'REMOTE_FAILED'}}))}})\"";
         let payload = Zeroizing::new(serde_json::to_vec(
             &json!({"code":STANDARD.encode(worker_source),"request":request}),
         )?);
-        ensure!(
-            payload.len() <= 16 * 1024 * 1024,
-            "Remote request exceeds size limit"
-        );
+        ensure!(payload.len() <= MAX, "Remote request exceeds size limit");
         let mut channel = self
             .session
             .channel_session()

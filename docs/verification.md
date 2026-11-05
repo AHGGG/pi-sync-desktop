@@ -1,5 +1,15 @@
 # Verification record
 
+## Saved-device workflow and custom-file update · 2026-11-05
+
+- `node --test backend/tests/*.test.mjs`: 142 tests passed. New coverage includes recursive text/binary copies, explicit standalone-policy choices, protected descendants, symlinks, nested repositories, case/Unicode collisions, stale directory inventories, partial recovery, prototype-named files, transport bounds and large base64 payloads.
+- `cargo test --locked --workspace`: 36 desktop and 9 core tests passed. Twelve native production-control tests cover first-run setup, saved selection, full-window review, cancel, no implicit apply, bulk file choices, repeat-click suppression, failed-versus-empty review and masked authentication.
+- `scripts/test-ssh.sh`: isolated localhost OpenSSH integration passed, including a 7 MiB custom directory (>8 MiB serialized snapshot), remote exact-byte apply, prior-file backup and target-only preservation. Only disposable keys and synthetic fixtures were used.
+- `cargo fmt --all -- --check`, warnings-denied workspace/all-targets Clippy and `node scripts/check-public.mjs` and final Linux release compilation passed.
+- Real GPUI/WGPU screenshots of onboarding, the two-pane selection view and synthetic review were inspected. Device-icon assets are explicitly bundled and tested. See [capture details](screenshots/README.md).
+
+These checks run on Linux with Rust 1.99.1 and Node 24.22.1, using existing native runtime libraries through temporary linker aliases and Swiftshader for offscreen rendering. They do not establish manual real-window use, remote Windows shell interoperability, real user-device connectivity, semantic permission-policy analysis, or signed installers. Native CI must be checked for the exact pushed commit. No user Pi harness/configuration or secrets were added to the repository.
+
 ## Private-model copy update · 2026-11-05
 
 - `node --test backend/tests/*.test.mjs`: 78 tests passed. Coverage includes unknown model schemas and valid JSON roots, exact-byte copies, malformed destination backups, missing/unreadable/invalid source skipping, excluded-file independence, private preview output, and source/target/concurrent-change guards.

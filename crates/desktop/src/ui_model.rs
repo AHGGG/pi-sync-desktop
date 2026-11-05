@@ -9,6 +9,7 @@ pub(crate) struct Device {
     pub address: String,
     pub status: String,
     pub is_local: bool,
+    pub platform: String,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct ConfigItem {
@@ -42,6 +43,8 @@ pub(crate) struct Snapshot {
     pub plan_id: Option<String>,
     pub results: Vec<(String, String)>,
     pub has_last_selection: bool,
+    pub selection_loaded: bool,
+    pub blocked_targets: Vec<(String, String)>,
     pub selected_item_ids: Vec<String>,
     pub target_ids: Vec<String>,
     pub command_details_reviewed: bool,
@@ -61,6 +64,12 @@ pub(crate) enum Command {
         targets: Vec<String>,
         items: Vec<String>,
     },
+    SaveSelection {
+        source: String,
+        targets: Vec<String>,
+        items: Vec<String>,
+    },
+    CancelReview,
     RepeatLast,
     RevealDetails {
         plan_id: String,
@@ -83,6 +92,9 @@ pub(crate) enum Command {
 }
 pub(crate) enum Event {
     Snapshot(Snapshot),
+    SelectionSaved {
+        has_last_selection: bool,
+    },
     Busy(String),
     Error(String),
     TrustHost {
