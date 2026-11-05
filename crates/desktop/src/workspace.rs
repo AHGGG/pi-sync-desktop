@@ -4,23 +4,34 @@ use crate::ui_model::*;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, Selectable, Sizable, WindowExt,
-    button::{Button, ButtonVariants},
+    button::{Button, ButtonCustomVariant, ButtonVariants},
     checkbox::Checkbox,
     dialog::DialogButtonProps,
+    diff::{Diff, DiffFile, DiffHunkSeparator, DiffMode, DiffSide, DiffState},
     form::{Field, Form},
     input::{Input, InputState},
-    radio::{Radio, RadioGroup},
     resizable::{h_resizable, resizable_panel},
+    tooltip::Tooltip,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet},
+    rc::Rc,
     sync::mpsc::{Receiver, Sender, TryRecvError},
     time::Duration,
 };
 
-actions!(pi_sync, [RefreshDevices, PrepareReview, RepeatSelection]);
+actions!(
+    pi_sync,
+    [
+        RefreshDevices,
+        PrepareReview,
+        RepeatSelection,
+        SelectAllSourceChanges
+    ]
+);
 
 #[derive(Clone)]
 struct DragItem {
@@ -53,6 +64,11 @@ pub(crate) struct Workspace {
     onboarding: bool,
     initial_snapshot_received: bool,
     source_picker_open: bool,
+    review_change_id: Option<String>,
+    review_pending_only: bool,
+    review_hovered_side: Option<Choice>,
+    review_hover_owner: Option<&'static str>,
+    review_diffs: BTreeMap<String, Entity<DiffState>>,
     setup_name: Entity<InputState>,
     setup_ssh: Entity<InputState>,
     setup_root: Entity<InputState>,
@@ -128,6 +144,11 @@ impl Workspace {
             onboarding: false,
             initial_snapshot_received: false,
             source_picker_open: false,
+            review_change_id: None,
+            review_pending_only: false,
+            review_hovered_side: None,
+            review_hover_owner: None,
+            review_diffs: BTreeMap::new(),
             setup_name: cx.new(|cx| InputState::new(window, cx).placeholder("Work laptop")),
             setup_ssh: cx
                 .new(|cx| InputState::new(window, cx).placeholder("ssh [user@]host-or-alias")),
@@ -150,8 +171,15 @@ impl Workspace {
         cx.notify();
     }
     fn invalidate_review(&mut self) {
+        self.review_diffs.clear();
+        self.review_change_id = None;
+        self.review_pending_only = false;
+        self.review_hovered_side = None;
+        self.review_hover_owner = None;
         self.snapshot.plan_id = None;
         self.snapshot.changes.clear();
+        self.snapshot.text_previews.clear();
+        self.snapshot.file_review_details.clear();
         self.choices.clear();
         self.snapshot.results.clear();
         self.snapshot.blocked_targets.clear();
@@ -206,8 +234,57 @@ impl Workspace {
                     self.targets = targets;
                 }
                 if snapshot.plan_id != self.snapshot.plan_id {
+                    self.review_change_id = None;
+                    self.review_pending_only = false;
+                    self.review_hovered_side = None;
+                    self.review_hover_owner = None;
                     self.choices.clear();
                 }
+                self.review_diffs = snapshot
+                    .changes
+                    .iter()
+                    .filter_map(|change| {
+                        if !change.source_available || change.path.starts_with("models.json") {
+                            return None;
+                        }
+                        let (before, after) = if change.id.contains(":files:") {
+                            {
+                                let (before, after) = snapshot.text_previews.get(&change.id)?;
+                                (before, after)
+                            }
+                        } else {
+                            (&change.before, &change.after)
+                        };
+                        // Constant patch filenames keep path/control characters out of the parser.
+                        // Full domain paths remain visible in the application's own headers.
+                        let extension = if change.id.contains(":files:") {
+                            change.path.rsplit('.').next().unwrap_or("txt")
+                        } else {
+                            "json"
+                        };
+                        let extension = if extension.chars().all(|c| c.is_ascii_alphanumeric()) {
+                            extension
+                        } else {
+                            "txt"
+                        };
+                        let name = format!("preview.{extension}");
+                        let patch = similar::TextDiff::configure()
+                            .timeout(Duration::from_millis(20))
+                            .diff_lines(after.as_str(), before.as_str())
+                            .unified_diff()
+                            .context_radius(3)
+                            .header(&name, &name)
+                            .to_string();
+                        let files = DiffFile::parse(&patch).ok()?;
+                        if files.is_empty() {
+                            return None;
+                        }
+                        Some((
+                            change.id.clone(),
+                            cx.new(|cx| DiffState::new(files, cx).with_mode(DiffMode::Split)),
+                        ))
+                    })
+                    .collect();
                 self.snapshot = snapshot;
                 self.targets.retain(|id| {
                     self.snapshot.devices.iter().any(|d| &d.id == id)
@@ -406,6 +483,7 @@ impl Workspace {
             .gap_4()
             .px_5()
             .py_4()
+            .when(reviewing, |el| el.py_2())
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
@@ -421,7 +499,7 @@ impl Workspace {
                     .child(if self.onboarding {
                         "1  Connect your devices"
                     } else if reviewing {
-                        "3  Review & confirm"
+                        "Review changes"
                     } else {
                         "2  Choose what goes where"
                     }),
@@ -659,7 +737,7 @@ impl Workspace {
             .collect::<Vec<_>>()
             .join(", ");
         let targets = if targets.is_empty() {
-            "None; all changes are kept or skipped".to_string()
+            "None; all target versions are kept".to_string()
         } else {
             targets
         };
@@ -677,7 +755,7 @@ impl Workspace {
                 .button_props(DialogButtonProps::default().ok_text("Apply changes"))
                 .child(format!("Apply {writes} reviewed changes to the selected target devices. Target files are checked again before writing. Previous versions of changed files are backed up; offline or changed targets are reported separately."))
                 .child(format!("Targets: {targets}"))
-                .when(private_transfer, |dialog| dialog.child("This selection includes whole files or MCP values that may contain private data. Extension code can execute in Pi; standalone permission policies can change tool access. Hidden or truncated contents are still copied in full to the named targets."))
+                .when(private_transfer, |dialog| dialog.child("Selected source files replace entire target files. This selection includes whole files or MCP values that may contain private data. Extension code can execute in Pi; standalone permission policies can change tool access. Hidden or truncated contents are still copied in full to the named targets."))
                 .on_ok(move |_, _, cx| entity.update(cx, |this, cx| {
                     if this.busy.is_some() || this.snapshot.plan_id.as_ref() != Some(&plan_id) { return false; }
                     this.send(Command::Apply { plan_id: plan_id.clone(), choices: choices.clone() }, "Applying the reviewed changes", cx);
@@ -686,236 +764,447 @@ impl Workspace {
         });
     }
 
-    fn render_review(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn review_choice(&self, change: &Change) -> Option<Choice> {
+        self.choices
+            .get(&change.id)
+            .copied()
+            .or_else(|| (!change.conflict && change.source_available).then_some(Choice::Source))
+    }
+
+    fn review_needs_decision(&self, change: &Change) -> bool {
+        self.review_choice(change).is_none()
+            || (!change.source_available && self.review_choice(change) == Some(Choice::Source))
+    }
+
+    fn review_device_name(device: &Device) -> String {
+        if device.is_local && !device.name.eq_ignore_ascii_case("This computer") {
+            format!("{} · this computer", device.name)
+        } else {
+            device.name.clone()
+        }
+    }
+
+    fn choose_review_side(&mut self, id: &str, choice: Choice, cx: &mut Context<Self>) {
+        if self.busy.is_some() || self.snapshot.plan_id.is_none() {
+            return;
+        }
+        let Some(change) = self.snapshot.changes.iter().find(|change| change.id == id) else {
+            return;
+        };
+        if choice == Choice::Source && !change.source_available {
+            return;
+        }
+        // This only stages a decision. All writes still require Confirm sync.
+        self.choices.insert(id.to_owned(), choice);
+        cx.notify();
+    }
+
+    fn select_all_source_changes(&mut self, cx: &mut Context<Self>) {
+        if self.busy.is_some() || self.snapshot.plan_id.is_none() {
+            return;
+        }
+        for change in &self.snapshot.changes {
+            if change.source_available {
+                self.choices.insert(change.id.clone(), Choice::Source);
+            }
+        }
+        // Unavailable sources remain unchanged, requiring an explicit keep-target
+        // decision if unresolved. MCP command-detail review is still enforced.
+        cx.notify();
+    }
+
+    fn hover_review_side(
+        &mut self,
+        owner: &'static str,
+        side: Option<Choice>,
+        cx: &mut Context<Self>,
+    ) {
+        if side.is_some() {
+            if self.review_hover_owner != Some(owner) || self.review_hovered_side != side {
+                self.review_hover_owner = Some(owner);
+                self.review_hovered_side = side;
+                cx.notify();
+            }
+        } else if self.review_hover_owner == Some(owner) {
+            self.review_hover_owner = None;
+            self.review_hovered_side = None;
+            cx.notify();
+        }
+    }
+
+    fn render_review_detail(&self, change: &Change, cx: &mut Context<Self>) -> impl IntoElement {
+        let source = self
+            .snapshot
+            .devices
+            .iter()
+            .find(|device| self.snapshot.source_id.as_ref() == Some(&device.id));
+        // Use the stable backend change prefix, never a potentially duplicate display name.
+        let target = self
+            .snapshot
+            .devices
+            .iter()
+            .find(|device| change.id.starts_with(&format!("{}:", device.id)));
+        let source_name = source
+            .map(Self::review_device_name)
+            .unwrap_or_else(|| "Selected source".into());
+        let target_name = target
+            .map(Self::review_device_name)
+            .unwrap_or_else(|| change.device.clone());
+        let destination_name = target
+            .map(|device| device.name.clone())
+            .unwrap_or_else(|| change.device.clone());
+        let whole_file = change.id.contains(":files:") || change.path.starts_with("models.json");
+        let diff = self.review_diffs.get(&change.id);
+        let unavailable = self
+            .snapshot
+            .changes
+            .iter()
+            .filter(|change| !change.source_available)
+            .count();
+        let eligible = self.snapshot.changes.len() - unavailable;
+        let id = change.id.clone();
+        let measured_bounds = Rc::new(Cell::new(None::<Bounds<Pixels>>));
+        let paint_bounds = measured_bounds.clone();
+        let permission_policy = self
+            .snapshot
+            .file_review_details
+            .get(&change.id)
+            .is_some_and(|details| details.permission_policy);
+        let click_entity = cx.entity();
+        div().flex().flex_col().size_full().min_w_0().min_h_0()
+            .child(div().px_4().py_2().border_b_1().border_color(cx.theme().border)
+                .flex().items_center().gap_2()
+                .child(div().flex_1().min_w_0().font_weight(FontWeight::SEMIBOLD).child(change.path.clone()))
+                .when(permission_policy, |el| el.child(div().id("permission-policy-warning").test_support()
+                    .text_xs().text_color(cx.theme().warning)
+                    .aria_label("Permission policy change: may grant or remove tool access")
+                    .tooltip(|window, cx| Tooltip::new("This whole-file policy replacement may grant or remove tool access.").build(window, cx))
+                    .child("Permission policy")))
+                .when(!whole_file, |el| el.child(div().text_xs().text_color(cx.theme().muted_foreground).child("Value snippet")))
+                .when(whole_file && diff.is_none(), |el| el.child(div().text_xs().text_color(cx.theme().muted_foreground).child("Safe preview")))
+                .when_some(diff.cloned(), |el, diff| {
+                    let previous = diff.clone();
+                    el.child(Button::new("previous-diff-hunk").small().ghost().label("↑")
+                        .accessibility_label("Previous change").tooltip("Previous change")
+                        .on_click(move |_, _, cx| previous.update(cx, |state, cx| state.previous_change(cx))))
+                      .child(Button::new("next-diff-hunk").small().ghost().label("↓")
+                        .accessibility_label("Next change").tooltip("Next change")
+                        .on_click(move |_, _, cx| diff.update(cx, |state, cx| state.next_change(cx))))
+                })
+                .child(Button::new("use-source-all").small().label("Use source for all changes →")
+                    .tooltip(format!("Select source for {eligible} changes. {unavailable} unavailable sources are excluded. Nothing is written until you confirm sync."))
+                    .disabled(self.busy.is_some() || eligible == 0)
+                    .on_click(cx.listener(|this, _, _, cx| this.select_all_source_changes(cx)))))
+            .child(div().flex().items_stretch()
+                .child(self.review_column_header(change, Choice::Source, source_name, source.map(|d| d.address.clone()).unwrap_or_default(), destination_name.clone(), cx))
+                .child(self.review_column_header(change, Choice::Target, target_name, target.map(|d| d.address.clone()).unwrap_or_default(), destination_name, cx)))
+            .child(div().id("review-code-surface").relative().flex_1().min_h_0().min_w_0()
+                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                    if let Some(bounds) = measured_bounds.get() {
+                        let side = if event.position.x < bounds.left() + bounds.size.width / 2. { Choice::Source } else { Choice::Target };
+                        this.hover_review_side("code", Some(side), cx);
+                    }
+                }))
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    if !*hovered { this.hover_review_side("code", None, cx); }
+                }))
+                .child(canvas(move |bounds, _, _| paint_bounds.set(Some(bounds)), |_, _, _, _| {}).absolute().inset_0())
+                .child(if let Some(diff) = diff {
+                Diff::new(diff).size_full().header_visible(false).line_number(true)
+                    .hunk_separator(DiffHunkSeparator::Simple).change_background(true).soft_wrap(true)
+                    .on_line_click(move |position, _, _, cx| {
+                        click_entity.update(cx, |this, cx| this.choose_review_side(&id,
+                            if position.side() == DiffSide::Original { Choice::Source } else { Choice::Target }, cx));
+                    })
+.into_any_element()
+            } else {
+                div().id(SharedString::from(format!("opaque-preview-{}", change.id))).test_support()
+                    .size_full().overflow_y_scroll().child(div().flex().items_stretch().min_h_full()
+                        .child(self.review_opaque_side(change, Choice::Source, change.after.clone(), cx))
+                        .child(self.review_opaque_side(change, Choice::Target, change.before.clone(), cx)))
+                    .into_any_element()
+            }))
+            .when(!change.source_available, |el| el.child(div().px_4().py_2().border_t_1().border_color(cx.theme().border)
+                .text_xs().text_color(cx.theme().danger)
+                .child("Source unavailable. Choose the target version.")))
+    }
+
+    fn review_column_header(
+        &self,
+        change: &Change,
+        side: Choice,
+        name: String,
+        address: String,
+        destination_name: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = self.review_choice(change) == Some(side);
+        let source = side == Choice::Source;
+        let disabled = self.busy.is_some() || (source && !change.source_available);
+        let hovered = self.review_hovered_side == Some(side) && !disabled;
+        let role = if source { "Source" } else { "Target" };
+        let action = if source {
+            format!("Use on {destination_name} →")
+        } else {
+            format!("Keep on {destination_name}")
+        };
+        let cue = if source && !change.source_available {
+            "Unavailable".to_string()
+        } else if hovered {
+            action.clone()
+        } else if selected {
+            "Selected".to_string()
+        } else {
+            String::new()
+        };
+        let cue = if source && !change.source_available {
+            cue
+        } else if selected {
+            format!("✓ {cue}")
+        } else if hovered {
+            format!("○ {cue}")
+        } else {
+            "○".to_string()
+        };
+        let details = self
+            .snapshot
+            .file_review_details
+            .get(&change.id)
+            .map(|details| {
+                let hash = if source {
+                    &details.source_hash
+                } else {
+                    &details.target_hash
+                };
+                format!(
+                    " Whole-file replacement. {}",
+                    hash.as_ref()
+                        .map(|hash| format!("SHA256 {hash}"))
+                        .unwrap_or_else(|| "File not present or unavailable.".into())
+                )
+            })
+            .unwrap_or_default();
+        let hover_owner = if source {
+            "source-header"
+        } else {
+            "target-header"
+        };
+        let id = change.id.clone();
+        div().id(SharedString::from(format!("pane-header-{side:?}-{id}"))).flex_1().min_w_0()
+        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+            this.hover_review_side(hover_owner, (*hovered).then_some(side), cx);
+        }))
+        .child(Button::new(SharedString::from(format!(
+            "choose-{}-{id}",
+            if source { "source" } else { "target" }
+        )))
+        .accessibility_label(format!(
+            "{action}: {name}{}",
+            if selected { ", selected" } else { "" }
+        ))
+        .tooltip(format!(
+            "{name} · {address}. {action}.{details} Select this header with Tab, then press Enter or Space."
+        ))
+        .custom(
+            ButtonCustomVariant::new(cx)
+                .color(cx.theme().background)
+                .foreground(cx.theme().foreground)
+                .hover(cx.theme().muted)
+                .active(cx.theme().muted),
+        )
+        .w_full()
+        .min_w_0()
+        .h_auto()
+        .rounded_none()
+        .border_0()
+        .border_b_2()
+        .border_color(if selected || hovered {
+            cx.theme().primary
+        } else {
+            cx.theme().border
+        })
+        .when(selected, |el| el.bg(cx.theme().primary.opacity(0.06)))
+        .px_4()
+        .py_3()
+        .disabled(disabled)
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(role),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(if selected || hovered {
+                            cx.theme().primary
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .child(cue),
+                ),
+        )
+        .selected(selected)
+        .toggled(selected)
+
+        .on_click(cx.listener(move |this, _, _, cx| this.choose_review_side(&id, side, cx))))
+    }
+
+    fn review_opaque_side(
+        &self,
+        change: &Change,
+        side: Choice,
+        content: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id = change.id.clone();
+        let disabled = self.busy.is_some() || (side == Choice::Source && !change.source_available);
+        div()
+            .id(SharedString::from(format!("opaque-side-{side:?}-{id}")))
+            .flex_1()
+            .min_w_0()
+            .p_4()
+            .text_sm()
+            .when(!disabled, |el| {
+                el.cursor_pointer()
+                    .hover(|el| el.bg(cx.theme().muted))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        this.hover_review_side(
+                            if side == Choice::Source {
+                                "source-opaque"
+                            } else {
+                                "target-opaque"
+                            },
+                            (*hovered).then_some(side),
+                            cx,
+                        );
+                    }))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.choose_review_side(&id, side, cx)),
+                    )
+            })
+            .child(content)
+    }
+
+    fn render_review(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let unresolved = self.unresolved();
         let needs_details = self.snapshot.needs_command_details(&self.choices);
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .min_w_0()
-            .child(
-                div()
-                    .px_5()
-                    .pt_5()
-                    .pb_4()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Review changes"),
-                            )
-                            .child(div().flex_1())
-                            .child(
-                                Button::new("back-to-selection")
-                                    .ghost()
-                                    .small()
-                                    .label("Cancel review")
-                                    .disabled(self.busy.is_some())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.invalidate_review();
-                                        this.send(Command::CancelReview, "Returning to your saved selection", cx);
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "{} changes · {} decisions needed",
-                                self.snapshot.changes.len(),
-                                unresolved
-                            )),
-                    ),
-            )
-            .when(self.snapshot.changes.iter().any(|change| change.id.contains(":files:")), |el| el.child(
-                div().px_5().pb_4().flex().items_center().gap_3()
-                    .child(Button::new("use-source-files").label("Use source for all file changes").disabled(self.busy.is_some())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            for change in &this.snapshot.changes {
-                                if change.id.contains(":files:") && change.source_available { this.choices.insert(change.id.clone(), Choice::Source); }
-                            }
-                            cx.notify();
-                        })))
-                    .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Whole files will be copied, including hidden or truncated contents. Confirm sync is still required."))
-            ))
-            .when(self.snapshot.changes.iter().any(|change| change.path.starts_with("mcp.json")), |el| el.child(
-                div().px_5().pb_4().flex().flex_col().gap_2()
-                    .child(Button::new("reveal-command-details").label(if self.snapshot.command_details_reviewed { "Command details shown" } else { "Reveal command details" })
+        let changes = &self.snapshot.changes;
+        let visible: Vec<_> = changes
+            .iter()
+            .filter(|change| !self.review_pending_only || self.review_needs_decision(change))
+            .collect();
+        let active = visible
+            .iter()
+            .copied()
+            .find(|change| self.review_change_id.as_ref() == Some(&change.id))
+            .or_else(|| visible.first().copied());
+        let copies = changes
+            .iter()
+            .filter(|change| {
+                self.review_choice(change) == Some(Choice::Source) && change.source_available
+            })
+            .count();
+        let unavailable = changes
+            .iter()
+            .filter(|change| !change.source_available)
+            .count();
+        let kept = changes.len() - copies - unresolved;
+        div().flex().flex_col().size_full().min_w_0()
+            .when(!self.snapshot.blocked_targets.is_empty(), |el| el.child(
+                div().id("blocked-review-notice").test_support().px_5().py_3().border_b_1().border_color(cx.theme().border)
+                    .text_color(cx.theme().danger)
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Review incomplete · some targets could not be checked"))
+                    .children(self.snapshot.blocked_targets.iter().map(|(device, reason)| div().text_sm().child(format!("{device}: {reason}"))))))
+            .when(changes.iter().any(|change| change.path.starts_with("mcp.json")), |el| el.child(
+                div().px_5().py_3().flex().items_center().gap_3().border_b_1().border_color(cx.theme().border)
+                    .child(Button::new("reveal-command-details").small().label(if self.snapshot.command_details_reviewed { "Command details shown" } else { "Reveal command details" })
                         .disabled(self.busy.is_some() || self.snapshot.command_details_reviewed)
                         .on_click(cx.listener(|this, _, _, cx| {
                             if let Some(plan_id) = this.snapshot.plan_id.clone() { this.send(Command::RevealDetails { plan_id }, "Reading command details for this review", cx); }
                         })))
-                    .child(div().text_xs().text_color(cx.theme().muted_foreground).child("May include secrets. Visible only on this computer. Review executable commands before applying MCP changes."))
-            ))
-            .child(
-                div()
-                    .id("review-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px_5()
-                    .pb_5()
-                    .flex()
-                    .flex_col()
-                    .gap_5()
-                    .when(!self.snapshot.blocked_targets.is_empty(), |el| el.child(
-                        div().id("blocked-review-notice").test_support().p_4().rounded(cx.theme().radius).border_1().border_color(cx.theme().danger).flex().flex_col().gap_2()
-                            .child(div().font_weight(FontWeight::SEMIBOLD).text_color(cx.theme().danger).child("Some targets could not be reviewed"))
-                            .children(self.snapshot.blocked_targets.iter().map(|(device, reason)| div().child(format!("{device}: {reason}"))))))
-                    .when(self.snapshot.changes.is_empty(), |el| {
-                        el.child(
-                            div().py_8().child(
-                                if self.snapshot.blocked_targets.is_empty() { "Already in sync. The selected files were read successfully and no differences were found." } else { "Review incomplete. One or more targets could not be checked. This does not mean they are in sync." },
-                            ),
-                        )
-                    })
-                    .children(self.snapshot.changes.iter().map(|change| {
-                        let id = change.id.clone();
-                        let choice = self.choices.get(&id).copied().or(if change.conflict {
-                            None
-                        } else {
-                            Some(Choice::Source)
-                        });
-                        let index = choice.map(|choice| match choice {
-                            Choice::Source => 0,
-                            Choice::Target => 1,
-                            Choice::Skip => 2,
-                        });
-                        div()
-                            .pb_5()
-                            .border_b_1()
-                            .border_color(cx.theme().border)
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(change.device.clone()),
-                            )
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(change.path.clone()),
-                            )
-                            .when(change.conflict, |el| {
-                                el.child(
-                                    div()
-                                        .mt_2()
-                                        .text_sm()
-                                        .text_color(cx.theme().warning)
-                                        .child(if change.id.contains(":files:") { "Whole-file copy: choose which version to keep" } else { "Conflict: choose which value to keep" }),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .mt_3()
-                                    .flex()
-                                    .gap_3()
-                                    .child(
+                    .child(div().flex_1().min_w_0().text_xs().text_color(cx.theme().muted_foreground)
+                        .child("May contain secrets. Required before copying MCP commands."))))
+            .child(div().flex_1().min_h_0().child(
+                h_resizable("review-panes")
+                    .child(resizable_panel().size(window.rem_size() * 14.).size_range(window.rem_size() * 11. ..window.rem_size() * 23.)
+                        .child(div().flex().flex_col().size_full().min_h_0().bg(cx.theme().background)
+                            .child(div().px_3().py_3().flex().items_center().gap_2()
+                                .child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!("Changes {}", changes.len())))
+                                .child(div().flex_1())
+                                .child(Checkbox::new("review-pending").small().label("Pending")
+                                    .checked(self.review_pending_only)
+                                    .on_click(cx.listener(|this, checked, _, cx| { this.review_pending_only = *checked; cx.notify(); }))))
+                            .child(div().id("review-scroll").flex_1().min_h_0().overflow_y_scroll()
+                                .child(div().px_2().pb_2().flex().flex_col().gap_1()
+                                    .children(visible.iter().enumerate().map(|(row, change)| {
+                                        let id = change.id.clone();
+                                        let selected = active.is_some_and(|active| active.id == change.id);
+                                        let status = if self.review_needs_decision(change) { if change.source_available { "Decision needed" } else { "Source unavailable · keep target" } } else { match self.review_choice(change) {
+                                            Some(Choice::Source) => "Copy to target", Some(Choice::Target) => "Keep target", _ => "Skipped",
+                                        }};
+                                        let short_path = change.path.split(" · ").next().unwrap_or(&change.path);
+                                        let title = short_path.rsplit('/').next().unwrap_or(short_path);
+                                        let group_start = self.snapshot.target_ids.len() > 1 && (row == 0 || visible[row - 1].device != change.device);
                                         div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .p_3()
-                                            .rounded(cx.theme().radius)
-                                            .bg(cx.theme().muted)
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child("Current target"),
-                                            )
-                                            .child(
-                                                div().mt_2().text_sm().child(change.before.clone()),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .p_3()
-                                            .rounded(cx.theme().radius)
-                                            .bg(cx.theme().accent)
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child("Incoming source"),
-                                            )
-                                            .child(
-                                                div().mt_2().text_sm().child(change.after.clone()),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div().mt_3().child(
-                                    RadioGroup::horizontal(SharedString::from(format!("resolve-{id}")))
-                                        .children([
-                                            Radio::from("Use source").disabled(!change.source_available),
-                                            Radio::from("Keep target"),
-                                            Radio::from("Skip"),
-                                        ])
-                                        .selected_index(index)
-                                        .disabled(self.busy.is_some())
-                                        .on_change(cx.listener(move |this, index, _, cx| {
-                                            this.choices.insert(
-                                                id.clone(),
-                                                match index {
-                                                    0 => Choice::Source,
-                                                    1 => Choice::Target,
-                                                    _ => Choice::Skip,
-                                                },
-                                            );
-                                            cx.notify();
-                                        })),
-                                ),
-                            )
-                    })),
-            )
-            .child(
-                div()
-                    .px_5()
-                    .py_4()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(if unresolved > 0 {
-                                "Make each remaining decision before applying."
-                            } else if needs_details {
-                                "Reveal and review command details, or keep/skip MCP changes."
-                            } else {
-                                "Only the reviewed selection will be applied."
-                            }),
-                    )
-                    .child(
-                        Button::new("apply-reviewed")
-                            .primary()
-                            .label("Confirm sync…")
-                            .disabled(
-                                self.busy.is_some()
-                                    || unresolved > 0
-                                    || needs_details
-                                    || self.snapshot.changes.is_empty(),
-                            )
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.confirm_apply(window, cx)),
-                            ),
-                    ),
-            )
+                                            .when(group_start, |el| el.child(div().px_2().pt_2().pb_1().text_xs()
+                                                .text_color(cx.theme().muted_foreground).child(change.device.clone())))
+                                            .child(Button::new(SharedString::from(format!("review-item-{id}")))
+                                                .accessibility_label(format!("{} on {}: {}", change.path, change.device, status))
+                                                .tooltip(format!("{} · {} · {}", change.path, change.device, status))
+                                                .custom(ButtonCustomVariant::new(cx)
+                                                    .color(cx.theme().background)
+                                                    .foreground(cx.theme().foreground)
+                                                    .hover(cx.theme().muted)
+                                                    .active(cx.theme().muted))
+                                                .selected(selected).w_full().h_auto().px_2().py_2()
+                                                .child(div().w_full().min_w_0().flex().items_center().gap_2()
+                                                    .child(div().text_xs().text_color(cx.theme().muted_foreground)
+                                                        .child(if !change.source_available { "!" } else if self.review_needs_decision(change) { "○" } else { "✓" }))
+                                                    .child(div().flex_1().min_w_0().truncate().text_sm()
+                                                        .font_weight(if selected { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                                                        .text_color(if selected { cx.theme().foreground } else { cx.theme().muted_foreground })
+                                                        .child(title.to_owned())))
+                                                .on_click(cx.listener(move |this, _, _, cx| { this.review_change_id = Some(id.clone()); this.review_hovered_side = None; this.review_hover_owner = None; cx.notify(); })))
+                                    }))
+                                    .when(visible.is_empty(), |el| el.child(div().p_3().text_color(cx.theme().muted_foreground).child(if changes.is_empty() { "No changes to review" } else { "No pending decisions" })))) )
+))
+                    .child(resizable_panel().size_range(window.rem_size() * 35. ..window.rem_size() * 120.)
+                        .child(if let Some(change) = active { self.render_review_detail(change, cx).into_any_element() } else {
+                            div().p_5().child(if changes.is_empty() {
+                                if self.snapshot.blocked_targets.is_empty() { "Already in sync. The selected files were read successfully and no differences were found." } else { "One or more targets could not be checked. This does not mean they are in sync." }
+                            } else { "All decisions are made. Clear Pending to revisit an item." }).into_any_element()
+                        }))))
+            .child(div().px_5().py_3().border_t_1().border_color(cx.theme().border).flex().items_center().gap_3()
+                .child(div().flex_1().min_w_0().text_sm().child(
+                    if unresolved > 0 { format!("{unresolved} {} left · {copies} to copy", if unresolved == 1 { "decision" } else { "decisions" }) }
+                    else if needs_details { "Review MCP command details to continue".into() }
+                    else { format!("{copies} to copy · {kept} kept") }))
+                .when(unavailable > 0, |el| el.child(div().text_xs().text_color(cx.theme().danger).child(format!("{unavailable} source unavailable"))))
+                .child(Button::new("back-to-selection").label("Cancel review").disabled(self.busy.is_some())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.invalidate_review();
+                        this.send(Command::CancelReview, "Returning to your saved selection", cx);
+                    })))
+                .child(Button::new("apply-reviewed").primary().label("Confirm sync…")
+                    .disabled(self.busy.is_some() || unresolved > 0 || needs_details || changes.is_empty())
+                    .on_click(cx.listener(|this, _, window, cx| this.confirm_apply(window, cx)))))
     }
 }
 
@@ -938,6 +1227,7 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &PrepareReview, _, cx| this.prepare(cx)))
+            .on_action(cx.listener(|this, _: &SelectAllSourceChanges, _, cx| this.select_all_source_changes(cx)))
             .on_action(cx.listener(|this, _: &RepeatSelection, _, cx| {
                 if !this.onboarding
                     && this.snapshot.plan_id.is_none()
@@ -963,7 +1253,7 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .child(if self.snapshot.plan_id.is_some() {
-                        self.render_review(cx).into_any_element()
+                        self.render_review(window, cx).into_any_element()
                     } else if self.onboarding {
                         self.render_onboarding(cx).into_any_element()
                     } else {
@@ -982,7 +1272,7 @@ impl Render for Workspace {
                             .into_any_element()
                     }),
             )
-            .child(
+            .when(self.snapshot.plan_id.is_none() || self.busy.is_some(), |el| el.child(
                 div()
                     .flex()
                     .items_center()
@@ -1013,7 +1303,7 @@ impl Render for Workspace {
                             }))
                     ))
                     .child("SSH passwords are not saved"),
-            )
+            ))
     }
 }
 

@@ -5193,6 +5193,7 @@ dependencies = [
  "gpui-kit",
  "serde",
  "serde_json",
+ "similar",
  "sync-core",
  "tempfile",
  "zeroize",

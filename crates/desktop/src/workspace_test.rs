@@ -1,7 +1,7 @@
 //! Real production-view integration tests. Fixtures exist only in this module.
 use super::Workspace;
 use crate::ui_model::{Change, Choice, Command, ConfigItem, Device, Snapshot};
-use gpui_kit::test::TestWindowExt;
+use gpui_kit::test::{TestQueryExt, TestWindowExt};
 use gpui_kit::{
     AnyWindowHandle, AppContext, Bounds, Entity, TestAppContext, WindowBounds, WindowOptions, px,
     size,
@@ -123,20 +123,17 @@ fn conflict_blocks_apply_until_keyboard_resolution_and_confirmation(cx: &mut Tes
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(window.find("apply-reviewed").disabled(), Some(true));
-        window.within("resolve-change").click(0usize, cx);
+        window.click("choose-source-change", cx);
         assert_eq!(view.read(cx).choices.get("change"), Some(&Choice::Source));
-        // The native radio does not steal focus on pointer activation. Tab
+        // The native pane header does not steal focus on pointer activation. Tab
         // through the actual focus chain to the second choice, then activate.
         for _ in 0..24 {
             window.press("tab", cx);
-            if window.within("resolve-change").find(1usize).focused() == Some(true) {
+            if window.find("choose-target-change").focused() == Some(true) {
                 break;
             }
         }
-        assert_eq!(
-            window.within("resolve-change").find(1usize).focused(),
-            Some(true)
-        );
+        assert_eq!(window.find("choose-target-change").focused(), Some(true));
         window.press("space", cx);
         assert_eq!(view.read(cx).choices.get("change"), Some(&Choice::Target));
         assert_ne!(window.find("apply-reviewed").disabled(), Some(true));
@@ -211,7 +208,7 @@ fn drag_stages_item_without_applying(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn unavailable_model_source_is_disabled_but_skip_can_be_confirmed(cx: &mut TestAppContext) {
+fn unavailable_model_source_is_disabled_but_target_can_be_confirmed(cx: &mut TestAppContext) {
     let (handle, view, received) = window(cx, true);
     cx.update_window(handle, |_, window, cx| {
         view.update(cx, |view, cx| {
@@ -220,15 +217,12 @@ fn unavailable_model_source_is_disabled_but_skip_can_be_confirmed(cx: &mut TestA
             cx.notify();
         });
         window.render_frame(cx);
-        assert_eq!(
-            window.within("resolve-change").find(0usize).disabled(),
-            Some(true)
-        );
-        window.within("resolve-change").click(0usize, cx);
+        assert_eq!(window.find("choose-source-change").disabled(), Some(true));
+        window.click("choose-source-change", cx);
         assert!(!view.read(cx).choices.contains_key("change"));
         assert_eq!(window.find("apply-reviewed").disabled(), Some(true));
-        window.within("resolve-change").click(2usize, cx);
-        assert_eq!(view.read(cx).choices.get("change"), Some(&Choice::Skip));
+        window.click("choose-target-change", cx);
+        assert_eq!(view.read(cx).choices.get("change"), Some(&Choice::Target));
         assert_ne!(window.find("apply-reviewed").disabled(), Some(true));
         window.click("apply-reviewed", cx);
         assert!(received.try_recv().is_err());
@@ -236,8 +230,8 @@ fn unavailable_model_source_is_disabled_but_skip_can_be_confirmed(cx: &mut TestA
     })
     .unwrap();
     match received.try_recv().expect("explicit Apply command") {
-        Command::Apply { choices, .. } => assert_eq!(choices["change"], Choice::Skip),
-        _ => panic!("only explicit confirmation applies the skipped selection"),
+        Command::Apply { choices, .. } => assert_eq!(choices["change"], Choice::Target),
+        _ => panic!("only explicit confirmation applies the keep-target selection"),
     }
 }
 
@@ -396,7 +390,7 @@ fn cancelling_confirmation_writes_nothing_and_apply_is_single_shot(cx: &mut Test
     let (handle, view, received) = window(cx, true);
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
-        window.within("resolve-change").click(0usize, cx);
+        window.click("choose-source-change", cx);
         window.click("apply-reviewed", cx);
         window.within("dialog").click("cancel", cx);
         assert!(received.try_recv().is_err());
@@ -413,7 +407,7 @@ fn cancelling_confirmation_writes_nothing_and_apply_is_single_shot(cx: &mut Test
 }
 
 #[gpui_kit::test]
-fn bulk_file_choice_still_requires_separate_confirmation(cx: &mut TestAppContext) {
+fn bulk_source_choice_still_requires_separate_confirmation(cx: &mut TestAppContext) {
     let (handle, view, received) = window(cx, true);
     cx.update_window(handle, |_, window, cx| {
         view.update(cx, |view, cx| {
@@ -423,7 +417,7 @@ fn bulk_file_choice_still_requires_separate_confirmation(cx: &mut TestAppContext
         });
         window.render_frame(cx);
         assert_eq!(window.find("apply-reviewed").disabled(), Some(true));
-        window.click("use-source-files", cx);
+        window.click("use-source-all", cx);
         assert_eq!(
             view.read(cx)
                 .choices
@@ -576,6 +570,327 @@ fn worker_error_closes_pending_host_trust_without_accepting(cx: &mut TestAppCont
         window.render_frame(cx);
         assert!(window.find_all("dialog").is_empty());
         assert!(view.read(cx).authentication.is_none());
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+fn review_snapshot(
+    view: &Entity<Workspace>,
+    changes: Vec<Change>,
+    previews: Vec<(&str, &str, &str)>,
+    window: &mut gpui_kit::Window,
+    cx: &mut gpui_kit::App,
+) {
+    let mut snapshot = view.read(cx).snapshot.clone();
+    snapshot.changes = changes;
+    snapshot.text_previews = previews
+        .into_iter()
+        .map(|(id, target, source)| (id.to_owned(), (target.to_owned(), source.to_owned())))
+        .collect();
+    view.update(cx, |view, cx| {
+        view.receive(crate::ui_model::Event::Snapshot(snapshot), window, cx)
+    });
+    window.render_frame(cx);
+}
+
+fn review_change(id: &str, path: &str, available: bool) -> Change {
+    Change {
+        id: id.into(),
+        device: "Target".into(),
+        path: path.into(),
+        before: "Target preview".into(),
+        after: "Source preview".into(),
+        conflict: true,
+        source_available: available,
+    }
+}
+
+fn click_point(
+    window: &mut gpui_kit::Window,
+    position: gpui_kit::Point<gpui_kit::Pixels>,
+    cx: &mut gpui_kit::App,
+) {
+    use gpui_kit::{MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput};
+    window.dispatch_event(
+        PlatformInput::MouseDown(MouseDownEvent {
+            position,
+            button: MouseButton::Left,
+            click_count: 1,
+            ..Default::default()
+        }),
+        cx,
+    );
+    window.render_frame(cx);
+    window.dispatch_event(
+        PlatformInput::MouseUp(MouseUpEvent {
+            position,
+            button: MouseButton::Left,
+            click_count: 1,
+            ..Default::default()
+        }),
+        cx,
+    );
+    window.render_frame(cx);
+}
+
+fn hover_point(
+    window: &mut gpui_kit::Window,
+    position: gpui_kit::Point<gpui_kit::Pixels>,
+    cx: &mut gpui_kit::App,
+) {
+    window.dispatch_event(
+        gpui_kit::PlatformInput::MouseMove(gpui_kit::MouseMoveEvent {
+            position,
+            ..Default::default()
+        }),
+        cx,
+    );
+    window.render_frame(cx);
+}
+
+#[gpui_kit::test]
+fn native_diff_sides_stay_aligned_and_clicks_do_not_apply(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    let long_line = format!("source-long-{}", "x".repeat(300));
+    cx.update_window(handle, |_, window, cx| {
+        let source = format!("source first\nsource second\n{long_line}\n");
+        let target = "target first\ntarget second\ntarget short\n";
+        review_snapshot(
+            &view,
+            vec![review_change(
+                "target:files:example.txt",
+                "example.txt",
+                true,
+            )],
+            vec![("target:files:example.txt", target, &source)],
+            window,
+            cx,
+        );
+    })
+    .unwrap();
+    // Diff measures its viewport after paint; process that native layout update.
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let left = window
+            .find("choose-source-target:files:example.txt")
+            .bounds();
+        let right = window
+            .find("choose-target-target:files:example.txt")
+            .bounds();
+        let source_line = window.find_by_label("source first").bounds();
+        let target_line = window.find_by_label("target first").bounds();
+        assert!(source_line.left() >= left.left() && source_line.right() <= left.right());
+        assert!(
+            target_line.left() >= right.left() && target_line.right() <= right.right(),
+            "target line {target_line:?}; right header {right:?}; left header {left:?}"
+        );
+        assert!(window.find_by_label(&long_line).bounds().right() <= left.right());
+        hover_point(window, source_line.center(), cx);
+        assert_eq!(view.read(cx).review_hovered_side, Some(Choice::Source));
+        hover_point(
+            window,
+            window.find_by_label("source second").bounds().center(),
+            cx,
+        );
+        assert_eq!(view.read(cx).review_hovered_side, Some(Choice::Source));
+        hover_point(window, target_line.center(), cx);
+        assert_eq!(view.read(cx).review_hovered_side, Some(Choice::Target));
+        window.hover("choose-source-target:files:example.txt", cx);
+        assert_eq!(view.read(cx).review_hovered_side, Some(Choice::Source));
+        assert_eq!(view.read(cx).review_hover_owner, Some("source-header"));
+        window.hover("choose-target-target:files:example.txt", cx);
+        assert_eq!(view.read(cx).review_hovered_side, Some(Choice::Target));
+        assert_eq!(view.read(cx).review_hover_owner, Some("target-header"));
+        hover_point(window, gpui_kit::point(px(40.), px(30.)), cx);
+        assert_eq!(view.read(cx).review_hovered_side, None);
+        click_point(window, source_line.center(), cx);
+        assert_eq!(
+            view.read(cx).choices["target:files:example.txt"],
+            Choice::Source
+        );
+        click_point(window, target_line.center(), cx);
+        assert_eq!(
+            view.read(cx).choices["target:files:example.txt"],
+            Choice::Target
+        );
+        view.update(cx, |view, _| {
+            view.choices.clear();
+        });
+        window.render_frame(cx);
+        let point = window.find_by_label("source first").bounds().center();
+        window.drag(point, point + gpui_kit::point(px(25.), px(0.)), cx);
+        assert!(
+            view.read(cx).choices.is_empty(),
+            "dragging text is not a version choice"
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "preview interaction never writes"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn bulk_selection_excludes_unavailable_and_preserves_mcp_gate(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    cx.update_window(handle, |_, window, cx| {
+        review_snapshot(
+            &view,
+            vec![
+                review_change("target:files:example.txt", "example.txt", true),
+                review_change("target:settings:/theme", "settings.json/theme", true),
+                review_change(
+                    "target:models:/",
+                    "models.json · entire private file",
+                    false,
+                ),
+                review_change("target:mcp:/server", "mcp.json/server", true),
+            ],
+            vec![],
+            window,
+            cx,
+        );
+        window.click("use-source-all", cx);
+        assert_eq!(view.read(cx).choices.len(), 3);
+        assert!(!view.read(cx).choices.contains_key("target:models:/"));
+        assert_eq!(window.find("apply-reviewed").disabled(), Some(true));
+        window.click("review-item-target:models:/", cx);
+        assert_eq!(
+            window.find("choose-source-target:models:/").disabled(),
+            Some(true)
+        );
+        window.click("choose-target-target:models:/", cx);
+        assert_eq!(view.read(cx).choices["target:models:/"], Choice::Target);
+        assert_eq!(view.read(cx).unresolved(), 0);
+        assert_eq!(
+            window.find("apply-reviewed").disabled(),
+            Some(true),
+            "MCP details still require review"
+        );
+        assert!(received.try_recv().is_err());
+        window.click("reveal-command-details", cx);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Command::RevealDetails { .. })
+        ));
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn pending_navigation_and_cancel_clear_ephemeral_review(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    cx.update_window(handle, |_, window, cx| {
+        let mut automatic = review_change("target:settings:/auto", "settings.json/auto", true);
+        automatic.conflict = false;
+        review_snapshot(
+            &view,
+            vec![
+                review_change("target:files:first.txt", "first.txt", true),
+                review_change("target:files:second.txt", "second.txt", true),
+                automatic,
+            ],
+            vec![("target:files:first.txt", "old\n", "new\n")],
+            window,
+            cx,
+        );
+        window.click("review-pending", cx);
+        assert!(
+            window
+                .find_all("review-item-target:settings:/auto")
+                .is_empty()
+        );
+        window.click("choose-source-target:files:first.txt", cx);
+        assert!(
+            window
+                .find_all("review-item-target:files:first.txt")
+                .is_empty()
+        );
+        assert!(
+            !window
+                .find_all("choose-target-target:files:second.txt")
+                .is_empty()
+        );
+        window.click("choose-target-target:files:second.txt", cx);
+        assert!(
+            window
+                .find_all("choose-target-target:files:second.txt")
+                .is_empty()
+        );
+        window.click("review-pending", cx);
+        window.click("review-item-target:files:first.txt", cx);
+        assert_eq!(
+            window
+                .find("choose-source-target:files:first.txt")
+                .checked(),
+            Some(true)
+        );
+        assert!(window.find_all("next-review-decision").is_empty());
+        window.click("back-to-selection", cx);
+        let state = view.read(cx);
+        assert!(state.snapshot.text_previews.is_empty());
+        assert!(state.snapshot.file_review_details.is_empty());
+        assert!(state.review_diffs.is_empty());
+        assert!(state.choices.is_empty());
+        assert!(matches!(received.try_recv(), Ok(Command::CancelReview)));
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn policy_marker_hashes_and_safe_opaque_previews_remain_discoverable(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    cx.update_window(handle, |_, window, cx| {
+        let id = "target:files:permissions.json";
+        view.update(cx, |view, _| {
+            view.snapshot.file_review_details.insert(
+                id.into(),
+                crate::ui_model::FileReviewDetails {
+                    source_hash: Some("source-hash".into()),
+                    target_hash: Some("target-hash".into()),
+                    permission_policy: true,
+                },
+            );
+        });
+        review_snapshot(
+            &view,
+            vec![review_change(id, "permissions.json", true)],
+            vec![(id, "{\"allow\": false}\n", "{\"allow\": true}\n")],
+            window,
+            cx,
+        );
+        assert!(!window.find_all("permission-policy-warning").is_empty());
+        assert!(
+            window
+                .find("choose-source-target:files:permissions.json")
+                .description()
+                .unwrap()
+                .contains("SHA256 source-hash")
+        );
+        assert!(
+            window
+                .find("choose-target-target:files:permissions.json")
+                .description()
+                .unwrap()
+                .contains("SHA256 target-hash")
+        );
+        window.click("choose-target-target:files:permissions.json", cx);
+        assert!(
+            !window.find_all("permission-policy-warning").is_empty(),
+            "policy marker does not depend on choice"
+        );
+        let mut private =
+            review_change("target:models:/", "models.json · entire private file", true);
+        private.before = "Private values hidden. SHA256 old".into();
+        private.after = "Private values hidden. SHA256 new".into();
+        review_snapshot(&view, vec![private], vec![], window, cx);
+        assert!(view.read(cx).review_diffs.is_empty());
+        assert!(!window.find_all("opaque-preview-target:models:/").is_empty());
         assert!(received.try_recv().is_err());
     })
     .unwrap();

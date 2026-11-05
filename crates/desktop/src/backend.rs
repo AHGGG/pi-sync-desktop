@@ -1,5 +1,7 @@
 //! Blocking I/O lives on one worker. The native view receives presentation only.
-use crate::ui_model::{Change, Choice, Command, ConfigItem, Device, Event, Snapshot};
+use crate::ui_model::{
+    Change, Choice, Command, ConfigItem, Device, Event, FileReviewDetails, Snapshot,
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -290,6 +292,8 @@ impl Backend {
         self.snapshot.plan_id = None;
         self.snapshot.command_details_reviewed = false;
         self.snapshot.changes.clear();
+        self.snapshot.text_previews.clear();
+        self.snapshot.file_review_details.clear();
         self.changes.clear();
     }
     fn busy(&self, text: &str) {
@@ -560,6 +564,8 @@ impl Backend {
             .and_then(Value::as_str)
             .map(str::to_owned);
         self.snapshot.changes.clear();
+        self.snapshot.text_previews.clear();
+        self.snapshot.file_review_details.clear();
         self.snapshot.results.clear();
         self.snapshot.blocked_targets.clear();
         self.snapshot.command_details_reviewed = result["commandDetailsRevealed"] == true;
@@ -624,6 +630,34 @@ impl Backend {
                     }
                     let path = file["path"].as_str().context("Invalid file review path")?;
                     let change_id = format!("{id}:files:{path}");
+                    self.snapshot.file_review_details.insert(
+                        change_id.clone(),
+                        FileReviewDetails {
+                            source_hash: file["sourceHash"].as_str().map(str::to_owned),
+                            target_hash: file["targetHash"].as_str().map(str::to_owned),
+                            permission_policy: file["warning"] == "PERMISSION_POLICY_CHANGE",
+                        },
+                    );
+                    // The engine already redacts sensitive/binary previews. Never fetch
+                    // extra content for the UI or mistake a placeholder for source code.
+                    let before = file["before"].as_str().unwrap_or("");
+                    let after = file["after"].as_str().unwrap_or("");
+                    if !file["error"].is_string()
+                        && file["sourceAvailable"] != false
+                        && (file["before"].is_null() || file["before"].is_string())
+                        && file["after"].is_string()
+                        && before.chars().count() <= 12_000
+                        && after.chars().count() <= 12_000
+                        && ![before, after].iter().any(|text| {
+                            text.contains("[Sensitive content hidden]")
+                                || text.contains("[Binary file: content hidden]")
+                                || text.contains("[Truncated]")
+                        })
+                    {
+                        self.snapshot
+                            .text_previews
+                            .insert(change_id.clone(), (before.to_owned(), after.to_owned()));
+                    }
                     self.snapshot.changes.push(Change {
                         id: change_id.clone(), device: name.clone(), path: path.into(),
                         before: custom_file_preview(&file["before"], file["targetHash"].as_str()),
@@ -656,7 +690,7 @@ impl Backend {
                     self.snapshot.results.push((
                         self.device_name(&id),
                         format!(
-                            "{} · choose Target or Skip for models to continue with other settings",
+                            "{} · choose the target version for models to continue with other settings",
                             explain(error)
                         ),
                     ));
@@ -680,7 +714,7 @@ impl Backend {
         );
         ensure!(
             self.snapshot.unresolved_count(&choices) == 0,
-            "Choose Target or Skip for unavailable source files and resolve the remaining conflicts"
+            "Choose the target version for unavailable source files and resolve the remaining conflicts"
         );
         ensure!(
             choices.keys().all(|id| self.changes.contains_key(id)),
@@ -695,7 +729,6 @@ impl Backend {
             let choice = match choice {
                 Choice::Source => "source",
                 Choice::Target => "target",
-                Choice::Skip => "skip",
             };
             if document == "files" {
                 file_choices[target][path] = json!(choice);
@@ -1038,7 +1071,7 @@ fn model_target_preview(hash: Option<&str>, inspected: bool) -> String {
 fn model_source_preview(hash: Option<&str>, error: Option<&str>) -> String {
     if let Some(error) = error {
         return format!(
-            "{}\nChoose Target or Skip to continue with other settings. Choosing Source remains blocked. Private values hidden.",
+            "{}\nChoose the target version to continue with other settings. Choosing Source remains blocked. Private values hidden.",
             explain(error)
         );
     }
@@ -1657,6 +1690,97 @@ mod tests {
         assert!(backend.engine.is_none());
     }
     #[test]
+    fn code_previews_accept_only_complete_available_text_and_clear_with_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = test_backend(dir.path());
+        for (path, before, after, error, available, expected) in [
+            (
+                "safe.txt",
+                json!("old"),
+                json!("new"),
+                Value::Null,
+                true,
+                true,
+            ),
+            ("new.txt", Value::Null, json!(""), Value::Null, true, true),
+            (
+                "sensitive.txt",
+                json!("[Sensitive content hidden]"),
+                json!("new"),
+                Value::Null,
+                true,
+                false,
+            ),
+            (
+                "binary.dat",
+                json!("old"),
+                json!("[Binary file: content hidden]"),
+                Value::Null,
+                true,
+                false,
+            ),
+            (
+                "truncated.txt",
+                json!("old"),
+                json!("content\n[Truncated]"),
+                Value::Null,
+                true,
+                false,
+            ),
+            (
+                "error.txt",
+                json!("old"),
+                json!("new"),
+                json!("FILE_UNREADABLE"),
+                true,
+                false,
+            ),
+            (
+                "unavailable.txt",
+                json!("old"),
+                json!("new"),
+                Value::Null,
+                false,
+                false,
+            ),
+            (
+                "invalid.txt",
+                json!(false),
+                json!({"not":"text"}),
+                Value::Null,
+                true,
+                false,
+            ),
+            (
+                "oversize.txt",
+                json!("old"),
+                json!("x".repeat(12_001)),
+                Value::Null,
+                true,
+                false,
+            ),
+        ] {
+            backend.set_plan(json!({"planId":"preview", "targets":[{"id":"local", "status":"conflicts", "files":[{
+                "path":path, "changed":true, "sourceAvailable":available, "before":before, "after":after, "error":error,
+                "sourceHash":"source-hash", "targetHash":"target-hash", "warning":"PERMISSION_POLICY_CHANGE"
+            }]}]})).unwrap();
+            let id = format!("local:files:{path}");
+            assert_eq!(
+                backend.snapshot.text_previews.contains_key(&id),
+                expected,
+                "{path}"
+            );
+            let details = &backend.snapshot.file_review_details[&id];
+            assert!(details.permission_policy);
+            assert_eq!(details.source_hash.as_deref(), Some("source-hash"));
+            assert_eq!(details.target_hash.as_deref(), Some("target-hash"));
+        }
+        backend.invalidate();
+        assert!(backend.snapshot.text_previews.is_empty());
+        assert!(backend.snapshot.file_review_details.is_empty());
+    }
+
+    #[test]
     fn hidden_file_reviews_still_identify_exact_bytes() {
         let preview =
             custom_file_preview(&json!("[Sensitive content hidden]"), Some("reviewed-hash"));
@@ -1807,7 +1931,7 @@ mod tests {
             "SOURCE_MODELS_MISSING",
         ] {
             let review = model_source_preview(None, Some(error));
-            assert!(review.contains("Choose Target or Skip"));
+            assert!(review.contains("Choose the target version"));
             assert!(review.contains("Choosing Source remains blocked"));
             assert!(!review.contains("Copy the entire"));
             assert!(!review.contains("SHA256"));

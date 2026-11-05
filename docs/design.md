@@ -11,7 +11,10 @@ The public source fetches only JSON from AHGGG/my-pi-harness, resolving HEAD to 
 - One light native window, familiar resizable panes, semantic GPUI Kit controls.
 - First-run SSH setup saves connections before continuing. This computer is the default source.
 - Two selection panes: source and selected configuration/files on the left, saved target-device cards on the right. Remote OS is not guessed.
-- Review replaces both panes. Cancel preserves the selection and discards the plan; confirmation is a separate action.
+- Review replaces both panes with a quiet file navigator and an aligned, wrapping native code diff. Source is always left and target right, identified by actual device names. Binary/private/truncated files keep safe metadata previews.
+- Click a pane header or code text to choose that version for the target; text-selection drags do not choose. Native headers support Tab/Enter/Space, and hover cues name the target. Source-for-all stages available changes only; unavailable sources and MCP command-detail gates remain explicit.
+- Pending filters unresolved version choices, not all unviewed or unsynced files. The bottom bar keeps Cancel next to Confirm. Cancel preserves selection and discards the plan, cached previews and decisions; confirmation is a separate action.
+- Whole-file hashes remain in header tooltips and standalone policy changes retain a visible compact marker. Full-replacement/private-content consequences are disclosed at final confirmation rather than repeated beneath every diff.
 - Drag-and-drop is an accelerator. Buttons and keyboard actions provide the same staging flow.
 - Confirmation summarizes scope; conflict choices never silently default to source.
 - Errors and per-device outcomes use text, not color alone. Blocked reviews never appear as a successful zero-difference result. A new selection invalidates the displayed review.

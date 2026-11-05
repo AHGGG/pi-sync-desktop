@@ -1,5 +1,10 @@
 //! Native GPUI entry point. No webview or embedded browser runtime.
-#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+// Keep development builds attached to Cargo's console so Ctrl+C reaches us.
+// Packaged release builds remain window-only, without an extra console window.
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 mod assets;
 mod backend;
 mod ui_model;

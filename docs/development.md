@@ -20,6 +20,10 @@ macOS: macOS 15+, Xcode command-line tools, standard Rust toolchain.
 
 Windows: Windows 10+, MSVC Rust toolchain, Visual Studio C++ build tools, Windows SDK and CMake. Node must be on PATH for the app and for remote SSH worker sessions. Remote Windows SSH requires Node executable lookup from the service's normal command environment; actual interoperability remains a validation item.
 
+Windows development builds keep the launching console attached: `cargo run --locked -p pi-sync-desktop` can be stopped with **Ctrl+C** in that terminal. Release builds (`--release`) use the Windows GUI subsystem so launching the app does not open an extra console; close the Pi Sync window to exit those builds. Ctrl+C is an immediate interruption, not an undo: if a sync was applying, inspect the targets and prepare a fresh review before trying again.
+
+The Windows desktop test suite sends a real console Ctrl+C to the production debug executable in its existing askpass mode, using a private console and a disposable loopback bridge. This checks console attachment and interrupt delivery without a GPU, real SSH server or saved configuration. A manual smoke test should also launch the normal GPUI window through Cargo, press Ctrl+C while idle and during a synthetic review, and confirm the window closes and the terminal prompt returns. Do not use a live apply to test interruption.
+
 ## System OpenSSH
 
 The client must support the transport's required options, including `SessionType`, `StdinNull`, `ForkAfterAuthentication` and forced askpass (`SSH_ASKPASS_REQUIRE=force`). An old client may fail configuration preflight; update the client rather than relaxing transport guards or server key-exchange settings. Install `openssh-client` on Debian/Ubuntu, the OpenSSH Client optional feature on Windows, or check the built-in `/usr/bin/ssh` and PATH on macOS. Windows first checks the system OpenSSH installation, then falls back to PATH.

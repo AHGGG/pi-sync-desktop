@@ -32,7 +32,12 @@ pub(crate) struct Change {
 pub(crate) enum Choice {
     Source,
     Target,
-    Skip,
+}
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FileReviewDetails {
+    pub source_hash: Option<String>,
+    pub target_hash: Option<String>,
+    pub permission_policy: bool,
 }
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Snapshot {
@@ -40,6 +45,9 @@ pub(crate) struct Snapshot {
     pub source_id: Option<String>,
     pub items: Vec<ConfigItem>,
     pub changes: Vec<Change>,
+    /// Bounded, already-redacted text only. Hidden/binary previews never enter the code diff.
+    pub text_previews: BTreeMap<String, (String, String)>,
+    pub file_review_details: BTreeMap<String, FileReviewDetails>,
     pub plan_id: Option<String>,
     pub results: Vec<(String, String)>,
     pub has_last_selection: bool,
@@ -200,7 +208,7 @@ mod tests {
     }
     #[test]
     fn all_explicit_conflict_choices_are_valid() {
-        for choice in [Choice::Source, Choice::Target, Choice::Skip] {
+        for choice in [Choice::Source, Choice::Target] {
             let snapshot = review(true);
             let choices = BTreeMap::from([("device/settings/theme".into(), choice)]);
             assert_eq!(snapshot.unresolved_count(&choices), 0);
@@ -251,16 +259,14 @@ mod tests {
         assert!(snapshot.reviewed_choices(&BTreeMap::new()).is_some());
     }
     #[test]
-    fn unavailable_source_requires_target_or_skip() {
+    fn unavailable_source_requires_target() {
         let mut snapshot = review(true);
         snapshot.changes[0].source_available = false;
         let source = BTreeMap::from([("device/settings/theme".into(), Choice::Source)]);
         assert_eq!(snapshot.unresolved_count(&source), 1);
         assert!(snapshot.reviewed_choices(&source).is_none());
-        for choice in [Choice::Target, Choice::Skip] {
-            let choices = BTreeMap::from([("device/settings/theme".into(), choice)]);
-            assert_eq!(snapshot.unresolved_count(&choices), 0);
-            assert!(snapshot.reviewed_choices(&choices).is_some());
-        }
+        let choices = BTreeMap::from([("device/settings/theme".into(), Choice::Target)]);
+        assert_eq!(snapshot.unresolved_count(&choices), 0);
+        assert!(snapshot.reviewed_choices(&choices).is_some());
     }
 }
