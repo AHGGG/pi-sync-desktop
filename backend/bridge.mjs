@@ -84,6 +84,11 @@ async function dispatch(message) {
         }
         break;
       }
+      case "review-file":
+        // This response alone intentionally bypasses redaction after the handler
+        // verifies explicit approval and the captured selected file scope.
+        result = await engine.reviewFile(message);
+        break;
       case "apply":
         result = await engine.apply(message);
         break;

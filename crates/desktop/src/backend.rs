@@ -1,6 +1,6 @@
 //! Blocking I/O lives on one worker. The native view receives presentation only.
 use crate::ui_model::{
-    Change, Choice, Command, ConfigItem, Device, Event, FileReviewDetails, Snapshot,
+    Change, Choice, Command, ConfigItem, Device, Event, FilePreview, FileReviewDetails, Snapshot,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -450,6 +450,53 @@ impl Backend {
                     .clone()
                     .context("There is no previous selection yet")?;
                 self.prepare(selection)?;
+            }
+            Command::ReviewFile {
+                plan_id,
+                change_id,
+                page,
+                choices,
+            } => {
+                ensure!(
+                    self.snapshot.plan_id.as_ref() == Some(&plan_id),
+                    "The review is no longer current"
+                );
+                let (target, document, path) = self
+                    .changes
+                    .get(&change_id)
+                    .context("The selected file is no longer in this review")?
+                    .clone();
+                ensure!(
+                    self.snapshot
+                        .changes
+                        .iter()
+                        .any(|change| change.id == change_id && change.source_available),
+                    "The source file is unavailable"
+                );
+                let mut resolutions = json!({});
+                for (id, choice) in choices {
+                    let (choice_target, choice_document, field) = self
+                        .changes
+                        .get(&id)
+                        .context("A review choice is stale. Prepare again")?;
+                    if choice_target == &target
+                        && choice_document == &document
+                        && !matches!(document.as_str(), "files" | "models")
+                    {
+                        resolutions[field] = json!(match choice {
+                            Choice::Source => "source",
+                            Choice::Target => "target",
+                        });
+                    }
+                }
+                self.busy("Reading the complete file for local review…");
+                let result = self.call(json!({"op":"review-file", "planId":plan_id, "targetId":target,
+                    "document":document, "path":if document == "files" { path.as_str() } else { "/" },
+                    "page":page, "approved":true, "resolutions":resolutions}))?;
+                let preview = file_preview(
+                    result, &plan_id, &change_id, &target, &document, &path, page,
+                )?;
+                let _ = self.events.send(Event::FilePreview(preview));
             }
             Command::Apply { plan_id, choices } => self.apply(plan_id, choices)?,
             Command::RevealDetails { plan_id } => {
@@ -1050,6 +1097,65 @@ fn safe_connection_error(error: &anyhow::Error) -> String {
 fn local_root() -> String {
     std::env::var("PI_CODING_AGENT_DIR").unwrap_or_else(|_| "~/.pi/agent".into())
 }
+fn file_preview(
+    result: Value,
+    plan_id: &str,
+    change_id: &str,
+    target: &str,
+    document: &str,
+    path: &str,
+    page: usize,
+) -> Result<FilePreview> {
+    let expected_path = if document == "files" { path } else { "/" };
+    ensure!(
+        result["planId"] == plan_id
+            && result["targetId"] == target
+            && result["document"] == document
+            && result["path"] == expected_path
+            && result["page"].as_u64() == Some(page as u64),
+        "Invalid file review response"
+    );
+    let page_count = result["pageCount"]
+        .as_u64()
+        .context("Invalid file review page count")? as usize;
+    ensure!(
+        page_count > page && page_count <= 4096,
+        "Invalid file review page count"
+    );
+    let format = result["format"]
+        .as_str()
+        .context("Invalid file review format")?;
+    ensure!(
+        matches!(format, "text" | "hex" | "json"),
+        "Invalid file review format"
+    );
+    let before = result["before"]
+        .as_str()
+        .context("Invalid file review content")?;
+    let after = result["after"]
+        .as_str()
+        .context("Invalid file review content")?;
+    ensure!(
+        before.len() <= 100_000 && after.len() <= 100_000,
+        "File review page is too large"
+    );
+    Ok(FilePreview {
+        plan_id: plan_id.into(),
+        change_id: change_id.into(),
+        file_name: if document == "files" {
+            path.into()
+        } else {
+            format!("{document}.json")
+        },
+        page,
+        page_count,
+        format: format.into(),
+        unresolved: result["unresolved"].as_u64().unwrap_or(0) as usize,
+        before: before.into(),
+        after: after.into(),
+    })
+}
+
 fn custom_file_preview(content: &Value, hash: Option<&str>) -> String {
     let content = content.as_str().unwrap_or("Not present");
     match hash {
@@ -1817,6 +1923,133 @@ mod tests {
         assert_eq!(response["id"], value["id"]);
         response
     }
+    #[test]
+    fn full_file_response_is_bounded_and_bound_to_request() {
+        let response = json!({"planId":"plan","targetId":"target","document":"models","path":"/","page":0,"pageCount":2,"format":"text","before":"old","after":"new"});
+        let preview = file_preview(
+            response.clone(),
+            "plan",
+            "target:models:/",
+            "target",
+            "models",
+            "/",
+            0,
+        )
+        .unwrap();
+        assert_eq!(preview.before, "old");
+        assert_eq!(preview.file_name, "models.json");
+        assert!(
+            file_preview(
+                response.clone(),
+                "other",
+                "target:models:/",
+                "target",
+                "models",
+                "/",
+                0
+            )
+            .is_err()
+        );
+        assert!(
+            file_preview(
+                response.clone(),
+                "plan",
+                "target:models:/",
+                "other",
+                "models",
+                "/",
+                0
+            )
+            .is_err()
+        );
+        assert!(
+            file_preview(
+                response.clone(),
+                "plan",
+                "target:models:/",
+                "target",
+                "models",
+                "/",
+                1
+            )
+            .is_err()
+        );
+        for (key, value) in [
+            ("pageCount", json!(0)),
+            ("format", json!("unknown")),
+            ("after", json!("x".repeat(100_001))),
+        ] {
+            let mut invalid = response.clone();
+            invalid[key] = value;
+            assert!(
+                file_preview(
+                    invalid,
+                    "plan",
+                    "target:models:/",
+                    "target",
+                    "models",
+                    "/",
+                    0
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_bridge_full_file_review_reveals_only_after_approval_and_preserves_merge() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = fs::canonicalize(root.path()).unwrap();
+        let source = root_path.join("source");
+        let target = root_path.join("target");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            source.join("mcp.json"),
+            r#"{"mcpServers":{"argent":{"command":"source-command"}}}"#,
+        )
+        .unwrap();
+        let original = r#"{"mcpServers":{"argent":{"command":"target-command","env":{"TOKEN":"synthetic-private-value"}},"localOnly":{"command":"keep-local"}}}"#;
+        fs::write(target.join("mcp.json"), original).unwrap();
+        let mut engine = Engine::spawn().unwrap();
+        let plan = exchange(
+            &mut engine,
+            json!({"id":1,"op":"preview","source":{"id":"source","type":"local","agentDir":source},"targets":[{"id":"target","type":"local","agentDir":target}],"items":["mcp"]}),
+        );
+        assert_eq!(plan["ok"], true);
+        assert!(!plan.to_string().contains("synthetic-private-value"));
+        let request = json!({"id":2,"op":"review-file","planId":plan["planId"],"targetId":"target","document":"mcp","path":"/","page":0,"approved":false,"resolutions":{"/mcpServers/argent/command":"source"}});
+        let denied = exchange(&mut engine, request.clone());
+        assert_eq!(denied["error"]["code"], "APPROVAL_REQUIRED");
+        let mut approved = request;
+        approved["id"] = json!(3);
+        approved["approved"] = json!(true);
+        let result = exchange(&mut engine, approved);
+        assert_eq!(result["ok"], true);
+        let preview = file_preview(
+            result,
+            plan["planId"].as_str().unwrap(),
+            "target:mcp:/mcpServers/argent/command",
+            "target",
+            "mcp",
+            "/",
+            0,
+        )
+        .unwrap();
+        let after: Value = serde_json::from_str(&preview.after).unwrap();
+        assert_eq!(after["mcpServers"]["argent"]["command"], "source-command");
+        assert_eq!(
+            after["mcpServers"]["argent"]["env"]["TOKEN"],
+            "synthetic-private-value"
+        );
+        assert_eq!(after["mcpServers"]["localOnly"]["command"], "keep-local");
+        assert_eq!(preview.unresolved, 0);
+        assert_eq!(
+            fs::read_to_string(target.join("mcp.json")).unwrap(),
+            original
+        );
+    }
+
     #[test]
     fn embedded_bridge_previews_resolves_and_applies_without_touching_other_values() {
         let root = tempfile::tempdir().unwrap();

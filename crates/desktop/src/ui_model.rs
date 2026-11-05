@@ -59,6 +59,12 @@ pub(crate) struct Snapshot {
 }
 /// Deliberately not Debug: credential payloads must never reach logs.
 pub(crate) enum Command {
+    ReviewFile {
+        plan_id: String,
+        change_id: String,
+        page: usize,
+        choices: BTreeMap<String, Choice>,
+    },
     Refresh,
     AddDevice {
         name: String,
@@ -99,7 +105,20 @@ pub(crate) enum Command {
         request_id: String,
     },
 }
+/// Explicitly revealed in-memory contents. Never derive Debug or persist this payload.
+pub(crate) struct FilePreview {
+    pub plan_id: String,
+    pub change_id: String,
+    pub file_name: String,
+    pub page: usize,
+    pub page_count: usize,
+    pub format: String,
+    pub unresolved: usize,
+    pub before: String,
+    pub after: String,
+}
 pub(crate) enum Event {
+    FilePreview(FilePreview),
     Snapshot(Snapshot),
     SelectionSaved {
         has_last_selection: bool,

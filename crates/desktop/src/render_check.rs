@@ -27,12 +27,14 @@ fn main() -> anyhow::Result<()> {
             "--fixture-overlay-idle" | "--fixture-overlay-hover" | "--fixture-overlay-selected"
         )
     });
+    let fixture_full_file = std::env::args().any(|arg| arg == "--fixture-full-file");
     let fixture_next_file = std::env::args().any(|arg| arg == "--fixture-next-file");
     let fixture_navigation = fixture_next_file
         || fixture_overlay.is_some()
         || std::env::args().any(|arg| arg == "--fixture-navigation");
-    let fixture_review =
-        fixture_navigation || std::env::args().any(|arg| arg == "--fixture-review");
+    let fixture_review = fixture_full_file
+        || fixture_navigation
+        || std::env::args().any(|arg| arg == "--fixture-review");
     if fixture_review {
         let ui_model::Event::Snapshot(snapshot) = &mut initial else {
             anyhow::bail!("Missing startup snapshot");
@@ -116,6 +118,14 @@ fn main() -> anyhow::Result<()> {
                 cx.new(|cx| {
                     let mut view = workspace::Workspace::new(commands, events, window, cx);
                     view.receive(initial, window, cx);
+                    if fixture_full_file {
+                        view.show_fixture_file_review(ui_model::FilePreview {
+                            plan_id: "synthetic-render-only".into(), change_id: "example:settings:/theme".into(),
+                            file_name: "settings.json".into(), page: 0, page_count: 1, format: "json".into(), unresolved: 0,
+                            before: "{\n  \"theme\": \"dark\",\n  \"defaultModel\": \"preserved-target-model\",\n  \"fixture\": true\n}\n".into(),
+                            after: "{\n  \"theme\": \"light\",\n  \"defaultModel\": \"preserved-target-model\",\n  \"fixture\": true\n}\n".into(),
+                        }, window, cx);
+                    }
                     view
                 })
             },

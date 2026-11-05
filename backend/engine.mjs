@@ -4,7 +4,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { handle, decodeModels, validateRelativePath, validatePathCollisions } from "./worker.mjs";
 import { SCHEMAS, validateDocument, mergeDocuments } from "./documents.mjs";
-import { cell, object, same } from "./merge.mjs";
+import { cell, object, same, mergeDocument } from "./merge.mjs";
 const fail = (code) => {
   throw new Error(code);
 };
@@ -65,6 +65,69 @@ function fileDisplay(record) {
     if (/(?:bearer\s|sk-[A-Za-z0-9]|(?:api[_-]?key|token|password|secret|authorization|credential)\s*["']?\s*[:=]|https?:\/\/[^/\s]*@|["']?(?:command|args)["']?\s*[:=])/i.test(text)) return '[Sensitive content hidden]';
     return text.slice(0, 12000) + (text.length > 12000 ? '\n[Truncated]' : '');
   } catch { return '[Binary file: content hidden]'; }
+}
+// Explicit private review is lossless. Decode strictly, preserve BOMs, and use hex
+// for both sides if either side contains binary data. Page boundaries never split
+// a surrogate pair; prefer complete lines where possible.
+function reviewPages(before, after) {
+  let texts;
+  try {
+    texts = [before, after].map(bytes => {
+      const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+      if (/[\x00-\x08\x0e-\x1f\x7f]/.test(text)) throw new Error('BINARY');
+      return text;
+    });
+  } catch { texts = null; }
+  const split = text => {
+    const pages = [];
+    for (let start = 0; start < text.length;) {
+      let end = Math.min(start + 12000, text.length);
+      if (end < text.length) {
+        if (text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff) end--;
+        const newline = text.lastIndexOf('\n', end - 1);
+        if (newline >= start) end = newline + 1;
+      }
+      pages.push(text.slice(start, end));
+      start = end;
+    }
+    return pages;
+  };
+  const hex = bytes => {
+    const pages = [];
+    for (let start = 0; start < bytes.length; start += 4096)
+      pages.push(Array.from({ length: Math.ceil(Math.min(4096, bytes.length - start) / 16) }, (_, line) => {
+        const offset = start + line * 16;
+        const content = bytes.subarray(offset, Math.min(offset + 16, bytes.length)).toString('hex').match(/.{1,2}/g).join(' ');
+        return offset.toString(16).padStart(8, '0') + ': ' + content;
+      }).join('\n') + '\n');
+    return pages;
+  };
+  const pages = texts ? texts.map(split) : [before, after].map(hex);
+  return { format: texts ? 'text' : 'hex', before: pages[0], after: pages[1],
+    pageCount: Math.max(1, ...pages.map(p => p.length)) };
+}
+// Pretty printing deeply nested target-only data can amplify a small file into
+// gigabytes of indentation. First serialize compactly, then conservatively bound
+// indentation expansion before attempting pretty JSON. Excessive recursion fails
+// with a content-free error rather than exposing private values in diagnostics.
+function reviewJson(value) {
+  let compact;
+  try { compact = JSON.stringify(value); }
+  catch { fail('JSON_REVIEW_TOO_DEEP'); }
+  let depth = 0, maximum = 0, quoted = false, escaped = false;
+  for (const char of compact) {
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') quoted = false;
+    } else if (char === '"') quoted = true;
+    else if (char === '{' || char === '[') maximum = Math.max(maximum, ++depth);
+    else if (char === '}' || char === ']') depth--;
+  }
+  // Every original character contributes at most one newline and maximum-depth
+  // indentation. Fall back to complete compact JSON, never truncate.
+  return (compact.length * (maximum * 2 + 3) <= 4 * 1024 * 1024
+    ? JSON.stringify(value, null, 2) : compact) + '\n';
 }
 function reviewFiles(source, target, choices = {}) {
   const names = [...new Set([...Object.keys(source), ...Object.keys(target)])].sort();
@@ -411,6 +474,72 @@ export class SyncEngine {
         plan.source.fingerprints.revision ?? plan.input.source.revision ?? null,
       commandDetailsRevealed: true,
     };
+  }
+  async reviewFile({ planId, targetId, document, path: relativePath, page, approved, resolutions = {} }) {
+    if (approved !== true) fail('APPROVAL_REQUIRED');
+    const plan = this.#plans.get(planId);
+    if (!plan) fail('PLAN_NOT_FOUND');
+    const checkCurrent = () => {
+      if (this.#plans.get(planId) !== plan) fail('PLAN_NOT_FOUND');
+      if (Date.now() - plan.created > 30 * 60 * 1000) {
+        this.#plans.delete(planId);
+        fail('PLAN_EXPIRED');
+      }
+    };
+    checkCurrent();
+    if (!Number.isSafeInteger(page) || page < 0) fail('INVALID_REVIEW_PAGE');
+    const item = plan.prepared.find(p => p.target.id === targetId);
+    if (!item) fail('INVALID_REVIEW_TARGET');
+    if (!Object.hasOwn(SCHEMAS, document) && (!object(resolutions) || Object.keys(resolutions).length))
+      fail('INVALID_REVIEW_SELECTION');
+    let before, after, unresolved;
+    if (document === 'models') {
+      if (relativePath !== '/' || !plan.input.items.includes('models') || !item.models || item.models.sourceHash === item.models.targetHash)
+        fail('INVALID_REVIEW_SELECTION');
+      if (item.models.error || !plan.source.models) fail('SOURCE_MODELS_UNAVAILABLE');
+      if (!item.modelReviewPages) {
+        const exported = await this.call(item.target, {
+          op: 'review-models', approved: true, expectedHash: item.models.targetHash,
+        });
+        checkCurrent();
+        if (typeof exported.modelsBase64 !== 'string') fail('INVALID_MODELS_ENCODING');
+        before = Buffer.from(exported.modelsBase64, 'base64');
+        if (exported.hash !== item.models.targetHash ||
+            (exported.hash === null ? before.length !== 0 : sha(before) !== exported.hash))
+          fail('TARGET_CHANGED');
+        after = Buffer.from(plan.source.models, 'base64');
+        item.modelReviewPages = reviewPages(before, after);
+      }
+    } else if (document === 'files') {
+      validateRelativePath(relativePath);
+      const row = item.files.find(f => f.path === relativePath && f.sourceAvailable && f.sourceHash !== f.targetHash);
+      if (!row || !Object.hasOwn(plan.source.customFiles, relativePath)) fail('INVALID_REVIEW_SELECTION');
+      before = Buffer.from(item.snapshot.customFiles?.[relativePath]?.base64 ?? '', 'base64');
+      after = Buffer.from(plan.source.customFiles[relativePath].base64, 'base64');
+    } else if (Object.hasOwn(SCHEMAS, document)) {
+      if (relativePath !== '/' || !plan.input.items.includes(document) || !item.merged.documents[document])
+        fail('INVALID_REVIEW_SELECTION');
+      const source = plan.source.values[document];
+      const target = item.snapshot[document].value ?? {};
+      const baseline = item.snapshot.state?.value?.documents?.[document] ?? null;
+      const merge = choices => mergeDocument(source, target, baseline, choices,
+        SCHEMAS[document], value => validateDocument(document, value));
+      const initial = merge({});
+      const selectable = new Set([...initial.changes, ...initial.conflicts].map(row => row.path));
+      if (!selectable.size || !object(resolutions) || Object.entries(resolutions).some(([key, choice]) =>
+        !selectable.has(key) || !['source', 'target', 'skip'].includes(choice))) fail('INVALID_REVIEW_SELECTION');
+      const captured = plan.resolutions?.[targetId]?.[document] ?? plan.input.resolutions?.[targetId]?.[document] ?? {};
+      const proposed = merge({ ...captured, ...resolutions });
+      unresolved = proposed.conflicts.length;
+      before = Buffer.from(item.snapshot[document].exists ? reviewJson(target) : '');
+      after = Buffer.from(reviewJson(proposed.result));
+    } else fail('INVALID_REVIEW_SELECTION');
+    const pages = document === 'models' ? item.modelReviewPages : reviewPages(before, after);
+    if (page >= pages.pageCount) fail('INVALID_REVIEW_PAGE');
+    return { planId, targetId, document, path: relativePath, page,
+      pageCount: pages.pageCount, format: unresolved === undefined ? pages.format : 'json',
+      ...(unresolved === undefined ? {} : { unresolved }),
+      before: pages.before[page] ?? '', after: pages.after[page] ?? '' };
   }
   async apply({ planId, approved, targetIds, commandReviewApproved }) {
     if (approved !== true) fail("APPROVAL_REQUIRED");

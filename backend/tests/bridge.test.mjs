@@ -167,3 +167,34 @@ test("native authentication owns transport lifetime without an independent bridg
   assert.equal(response.ok, true);
   assert.equal(response.targets[0].status, "ready");
 });
+
+test('only an approved per-file response bypasses private content redaction', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-file-review-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const source = { id: 'source', type: 'local', agentDir: path.join(root, 'source') };
+  const target = { id: 'target', type: 'local', agentDir: path.join(root, 'target') };
+  for (const dir of [source, target]) await fs.mkdir(dir.agentDir);
+  const secret = 'sk-EXPLICIT_PRIVATE_REVIEW';
+  await fs.writeFile(path.join(source.agentDir, 'models.json'), JSON.stringify({ apiKey: secret }));
+  await fs.writeFile(path.join(target.agentDir, 'models.json'), '{}');
+  await fs.writeFile(path.join(source.agentDir, 'notes.txt'), 'token: ' + secret);
+  const request = bridge(t);
+  const p = await request({ op: 'preview', source, targets: [target], items: ['models', 'path:notes.txt'] });
+  assert.equal(p.ok, true);
+  assert.doesNotMatch(JSON.stringify(p), /EXPLICIT_PRIVATE_REVIEW/);
+  const base = { op: 'review-file', planId: p.planId, targetId: 'target', document: 'models', path: '/', page: 0 };
+  const denied = await request(base);
+  assert.equal(denied.error.code, 'APPROVAL_REQUIRED');
+  assert.doesNotMatch(JSON.stringify(denied), /EXPLICIT_PRIVATE_REVIEW/);
+  const full = await request({ ...base, approved: true });
+  assert.equal(full.ok, true);
+  assert.equal(JSON.parse(full.after).apiKey, secret);
+  const file = await request({ ...base, document: 'files', path: 'notes.txt', approved: true });
+  assert.equal(file.after, 'token: ' + secret);
+  const reveal = await request({ op: 'reveal', planId: p.planId, approved: true });
+  assert.doesNotMatch(JSON.stringify(reveal), /EXPLICIT_PRIVATE_REVIEW/);
+  const resolved = await request({ op: 'resolve', planId: p.planId });
+  assert.doesNotMatch(JSON.stringify(resolved), /EXPLICIT_PRIVATE_REVIEW/);
+  await request({ op: 'discard', planId: resolved.planId });
+  assert.equal((await request({ ...base, planId: resolved.planId, approved: true })).error.code, 'PLAN_NOT_FOUND');
+});

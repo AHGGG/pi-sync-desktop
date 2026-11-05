@@ -12,7 +12,7 @@ use gpui_kit::component::{
         DiffMode, DiffSide, DiffState,
     },
     form::{Field, Form},
-    input::{Input, InputState},
+    input::{Editor, EditorState, Input, InputState},
     resizable::{h_resizable, resizable_panel},
     tooltip::Tooltip,
 };
@@ -66,6 +66,14 @@ struct ReviewDiff {
     active: usize,
 }
 
+struct FullFileReview {
+    preview: FilePreview,
+    source: Entity<EditorState>,
+    target: Entity<EditorState>,
+    diff: Option<Entity<DiffState>>,
+    show_diff: bool,
+}
+
 struct ReviewDestination {
     change_id: String,
     hunk: Option<usize>,
@@ -116,6 +124,8 @@ pub(crate) struct Workspace {
     review_hovered_side: Option<Choice>,
     review_hover_owner: Option<&'static str>,
     review_diffs: BTreeMap<String, ReviewDiff>,
+    full_file_review: Option<FullFileReview>,
+    file_review_request: Option<(String, String)>,
     review_pointer: Option<(String, Point<Pixels>, bool)>,
     review_pointer_blocked: bool,
     setup_name: Entity<InputState>,
@@ -202,6 +212,8 @@ impl Workspace {
             review_hovered_side: None,
             review_hover_owner: None,
             review_diffs: BTreeMap::new(),
+            full_file_review: None,
+            file_review_request: None,
             review_pointer: None,
             review_pointer_blocked: true,
             setup_name: cx.new(|cx| InputState::new(window, cx).placeholder("Work laptop")),
@@ -226,6 +238,7 @@ impl Workspace {
         cx.notify();
     }
     fn invalidate_review(&mut self) {
+        self.close_file_review();
         self.review_diffs.clear();
         self.review_pointer = None;
         self.review_pointer_blocked = true;
@@ -273,6 +286,7 @@ impl Workspace {
     pub(crate) fn receive(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             Event::Snapshot(snapshot) => {
+                self.close_file_review();
                 // Do not complete a press against preview content replaced mid-gesture.
                 self.review_pointer = None;
                 self.review_pointer_blocked = true;
@@ -405,6 +419,57 @@ impl Workspace {
                 });
                 self.busy = None;
             }
+            Event::FilePreview(preview) => {
+                if self.snapshot.plan_id.as_ref() == Some(&preview.plan_id)
+                    && self.file_review_request.as_ref()
+                        == Some(&(preview.plan_id.clone(), preview.change_id.clone()))
+                    && self
+                        .active_review_change()
+                        .is_some_and(|change| change.id == preview.change_id)
+                {
+                    let source = cx.new(|cx| {
+                        let mut state = EditorState::new(window, cx);
+                        state.set_value(preview.after.clone(), window, cx);
+                        state.set_readonly(true, cx);
+                        state.set_folding(false, window, cx);
+                        state
+                    });
+                    let target = cx.new(|cx| {
+                        let mut state = EditorState::new(window, cx);
+                        state.set_value(preview.before.clone(), window, cx);
+                        state.set_readonly(true, cx);
+                        state.set_folding(false, window, cx);
+                        state
+                    });
+                    let text_diff = similar::TextDiff::configure()
+                        .timeout(Duration::from_millis(20))
+                        .diff_lines(preview.after.as_str(), preview.before.as_str());
+                    // The complete bounded page, not just a few context lines.
+                    let patch = text_diff
+                        .unified_diff()
+                        .context_radius(12_000)
+                        .header("review.txt", "review.txt")
+                        .to_string();
+                    let diff = DiffFile::parse(&patch)
+                        .ok()
+                        .filter(|files| !files.is_empty())
+                        .map(|files| {
+                            cx.new(|cx| DiffState::new(files, cx).with_mode(DiffMode::Split))
+                        });
+                    let show_diff = self
+                        .full_file_review
+                        .as_ref()
+                        .map_or(diff.is_some(), |review| review.show_diff);
+                    self.full_file_review = Some(FullFileReview {
+                        preview,
+                        source,
+                        target,
+                        diff,
+                        show_diff,
+                    });
+                }
+                self.busy = None;
+            }
             Event::SelectionSaved { has_last_selection } => {
                 self.snapshot.has_last_selection = has_last_selection;
             }
@@ -413,6 +478,7 @@ impl Workspace {
                 self.error = None;
             }
             Event::Error(message) => {
+                self.close_file_review();
                 self.close_authentication(window, cx);
                 self.error = Some(message);
                 self.busy = None;
@@ -436,6 +502,99 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    #[cfg(feature = "render-check")]
+    #[allow(
+        dead_code,
+        reason = "The shared module also compiles into the normal app; this entry point is only used by the render-check binary."
+    )]
+    pub(crate) fn show_fixture_file_review(
+        &mut self,
+        preview: FilePreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.review_change_id = Some(preview.change_id.clone());
+        self.choices
+            .insert(preview.change_id.clone(), Choice::Source);
+        self.file_review_request = Some((preview.plan_id.clone(), preview.change_id.clone()));
+        self.receive(Event::FilePreview(preview), window, cx);
+    }
+
+    fn close_file_review(&mut self) {
+        self.full_file_review = None;
+        self.file_review_request = None;
+    }
+
+    fn request_file_review(&mut self, change_id: String, page: usize, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(plan_id) = self.snapshot.plan_id.clone() else {
+            return;
+        };
+        if !self
+            .active_review_change()
+            .is_some_and(|change| change.id == change_id && change.source_available)
+        {
+            return;
+        }
+        let choices = self
+            .snapshot
+            .changes
+            .iter()
+            .filter_map(|change| {
+                self.review_choice(change)
+                    .map(|choice| (change.id.clone(), choice))
+            })
+            .collect();
+        self.file_review_request = Some((plan_id.clone(), change_id.clone()));
+        self.send(
+            Command::ReviewFile {
+                plan_id,
+                change_id,
+                page,
+                choices,
+            },
+            "Reading the complete file for local review",
+            cx,
+        );
+    }
+
+    fn confirm_file_review(
+        &mut self,
+        change_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(plan_id) = self.snapshot.plan_id.clone() else {
+            return;
+        };
+        let Some(change) = self
+            .active_review_change()
+            .filter(|change| change.id == change_id && change.source_available)
+        else {
+            return;
+        };
+        let path = change.path.clone();
+        let device = change.device.clone();
+        let entity = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let entity = entity.clone(); let change_id = change_id.clone(); let plan_id = plan_id.clone();
+            dialog.title("Show complete file contents?").confirm()
+                .button_props(DialogButtonProps::default().ok_text("Show contents"))
+                .child(format!("Review {path} for {device} in this window. Contents can include credentials and private target-only settings. Anyone who can see or capture your screen may see them."))
+                .child("This reads the captured file and does not copy it to another device or choose a version. Large files are paged without truncation. Binary files are shown as hexadecimal bytes. Close the full-file view to hide the contents again.")
+                .on_ok(move |_, _, cx| entity.update(cx, |this, cx| {
+                    if this.busy.is_some() || this.snapshot.plan_id.as_ref() != Some(&plan_id)
+                        || !this.active_review_change().is_some_and(|change| change.id == change_id) { return false; }
+                    this.request_file_review(change_id.clone(), 0, cx); true
+                }).unwrap_or(false))
+        });
     }
 
     fn close_authentication(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -904,6 +1063,7 @@ impl Workspace {
         if choice == Choice::Source && !change.source_available {
             return;
         }
+        self.close_file_review();
         // This only stages a decision. All writes still require Confirm sync.
         self.choices.insert(id.to_owned(), choice);
         cx.notify();
@@ -1003,6 +1163,7 @@ impl Workspace {
         let Some(destination) = self.review_destination(id, forward) else {
             return;
         };
+        self.close_file_review();
         if destination.change_id != id {
             self.review_change_id = Some(destination.change_id.clone());
             // A press begun on the old item cannot select content on the new one.
@@ -1030,7 +1191,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if window.has_active_dialog(cx) {
+        if window.has_active_dialog(cx)
+            || self.full_file_review.is_some()
+            || self.file_review_request.is_some()
+        {
             return;
         }
         let Some(id) = self.active_review_change().map(|change| change.id.clone()) else {
@@ -1047,6 +1211,7 @@ impl Workspace {
         if self.busy.is_some() || self.snapshot.plan_id.is_none() {
             return;
         }
+        self.close_file_review();
         for change in &self.snapshot.changes {
             if change.source_available {
                 self.choices.insert(change.id.clone(), Choice::Source);
@@ -1123,6 +1288,7 @@ impl Workspace {
             .filter(|change| !change.source_available)
             .count();
         let eligible = self.snapshot.changes.len() - unavailable;
+        let file_id = change.id.clone();
         let click_id = change.id.clone();
         let down_id = change.id.clone();
         let measured_bounds = Rc::new(Cell::new(None::<Bounds<Pixels>>));
@@ -1136,8 +1302,10 @@ impl Workspace {
             .is_some_and(|details| details.permission_policy);
         div().flex().flex_col().size_full().min_w_0().min_h_0()
             .child(div().px_4().py_2().border_b_1().border_color(cx.theme().border)
-                .flex().items_center().gap_2()
-                .child(div().flex_1().min_w_0().font_weight(FontWeight::SEMIBOLD).child(change.path.clone()))
+                .flex().flex_wrap().items_center().gap_2()
+                .child(div().id("review-file-path").flex_1().min_w(px(180.)).truncate().font_weight(FontWeight::SEMIBOLD)
+                    .tooltip({ let path = change.path.clone(); move |window, cx| Tooltip::new(path.clone()).build(window, cx) })
+                    .child(change.path.clone()))
                 .when(permission_policy, |el| el.child(div().id("permission-policy-warning").test_support()
                     .text_xs().text_color(cx.theme().warning)
                     .aria_label("Permission policy change: may grant or remove tool access")
@@ -1160,6 +1328,10 @@ impl Workspace {
                         .disabled(self.busy.is_some() || next.is_none())
                         .on_click(cx.listener(move |this, _, _, cx| this.navigate_review(&next_id, true, cx))))
                 })
+                .child(Button::new("review-full-file").small().label("Review full file…")
+                    .tooltip("Inspect all file contents locally, including private values, without choosing a version.")
+                    .disabled(self.busy.is_some() || !change.source_available)
+                    .on_click(cx.listener(move |this, _, window, cx| this.confirm_file_review(file_id.clone(), window, cx))))
                 .child(Button::new("use-source-all").small().label("Use source for all changes →")
                     .tooltip(format!("Select source for {eligible} changes. {unavailable} unavailable sources are excluded. Nothing is written until you confirm sync."))
                     .disabled(self.busy.is_some() || eligible == 0)
@@ -1500,6 +1672,168 @@ impl Workspace {
             .child(content)
     }
 
+    fn render_full_file_review(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let review = self.full_file_review.as_ref().unwrap();
+        let preview = &review.preview;
+        let previous_id = preview.change_id.clone();
+        let next_id = preview.change_id.clone();
+        let page = preview.page;
+        let structured = preview.format == "json";
+        let content_label = if structured {
+            "Proposed target · current choices"
+        } else {
+            "Source · entire-file candidate"
+        };
+        let mut description = if preview.unresolved > 0 {
+            format!(
+                "{} undecided fields keep their target values in this provisional view. Return to decisions to choose them, then reopen to see the updated result.",
+                preview.unresolved
+            )
+        } else if structured {
+            "Complete proposed JSON values, including preserved target-only settings. Formatting is normalized. Return to decisions before changing choices or syncing.".into()
+        } else if preview.format == "hex" {
+            "Complete binary bytes in hexadecimal with file offsets. This is a byte inspection, not a visual or semantic preview. Copying still replaces the entire file.".into()
+        } else {
+            "Complete captured text, including private values. This is the source candidate, not a choice to copy it. Copying replaces the entire file.".into()
+        };
+        if preview.page_count > 1 {
+            description.push_str(" Pages are split independently on each side; highlighting compares this page only. An empty panel can mean the end of that side's contents.");
+        }
+        div()
+            .id("full-file-review")
+            .test_support()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h_0()
+            .min_w_0()
+            .child(
+                div()
+                    .px_4()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(format!("{} · full file", preview.file_name)),
+                    )
+                    .child(
+                        Button::new("close-full-file")
+                            .small()
+                            .label("Hide contents · back")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_file_review();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .px_4()
+                    .py_2()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(description.clone().test_text(description)),
+            )
+            .child(
+                div()
+                    .px_4()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().id("file-review-page").test_support().child(format!(
+                        "Page {} of {} · {}",
+                        page + 1,
+                        preview.page_count,
+                        preview.format
+                    )))
+                    .child(
+                        Button::new("previous-file-page")
+                            .small()
+                            .label("Previous page")
+                            .disabled(self.busy.is_some() || page == 0)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if page > 0 {
+                                    this.request_file_review(previous_id.clone(), page - 1, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("next-file-page")
+                            .small()
+                            .label("Next page")
+                            .disabled(self.busy.is_some() || page + 1 >= preview.page_count)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.request_file_review(next_id.clone(), page + 1, cx)
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Checkbox::new("full-file-diff")
+                            .small()
+                            .label("Highlight page differences")
+                            .checked(review.show_diff)
+                            .disabled(review.diff.is_none())
+                            .on_change(cx.listener(|this, checked, _, cx| {
+                                if let Some(review) = &mut this.full_file_review {
+                                    review.show_diff = *checked;
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(div().flex_1().px_4().py_2().child(content_label))
+                    .child(div().flex_1().px_4().py_2().child("Target · before sync")),
+            )
+            .child(div().flex_1().min_h_0().min_w_0().child(
+                if review.show_diff
+                    && let Some(diff) = &review.diff
+                {
+                    Diff::new(diff)
+                        .size_full()
+                        .header_visible(false)
+                        .line_number(true)
+                        .hunk_separator(DiffHunkSeparator::Simple)
+                        .soft_wrap(true)
+                        .into_any_element()
+                } else {
+                    div()
+                        .flex()
+                        .size_full()
+                        .min_w_0()
+                        .min_h_0()
+                        .child(
+                            div().flex_1().min_w_0().min_h_0().child(
+                                Editor::new(&review.source)
+                                    .readonly(true)
+                                    .h_full()
+                                    .aria_label("Complete source or proposed target file page"),
+                            ),
+                        )
+                        .child(
+                            div().flex_1().min_w_0().min_h_0().child(
+                                Editor::new(&review.target)
+                                    .readonly(true)
+                                    .h_full()
+                                    .aria_label("Complete original target file page"),
+                            ),
+                        )
+                        .into_any_element()
+                },
+            ))
+    }
+
     fn render_review(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let unresolved = self.unresolved();
         let needs_details = self.snapshot.needs_command_details(&self.choices);
@@ -1544,7 +1878,7 @@ impl Workspace {
                                 .child(div().flex_1())
                                 .child(Checkbox::new("review-pending").small().label("Pending")
                                     .checked(self.review_pending_only)
-                                    .on_click(cx.listener(|this, checked, _, cx| { this.review_pending_only = *checked; cx.notify(); }))))
+                                    .on_click(cx.listener(|this, checked, _, cx| { this.close_file_review(); this.review_pending_only = *checked; cx.notify(); }))))
                             .child(div().id("review-scroll").flex_1().min_h_0().overflow_y_scroll()
                                 .child(div().px_2().pb_2().flex().flex_col().gap_1()
                                     .children(visible.iter().enumerate().map(|(row, change)| {
@@ -1575,12 +1909,14 @@ impl Workspace {
                                                         .font_weight(if selected { FontWeight::MEDIUM } else { FontWeight::NORMAL })
                                                         .text_color(if selected { cx.theme().foreground } else { cx.theme().muted_foreground })
                                                         .child(title.to_owned())))
-                                                .on_click(cx.listener(move |this, _, _, cx| { this.review_change_id = Some(id.clone()); this.review_hovered_side = None; this.review_hover_owner = None; cx.notify(); })))
+                                                .on_click(cx.listener(move |this, _, _, cx| { this.close_file_review(); this.review_change_id = Some(id.clone()); this.review_hovered_side = None; this.review_hover_owner = None; cx.notify(); })))
                                     }))
                                     .when(visible.is_empty(), |el| el.child(div().p_3().text_color(cx.theme().muted_foreground).child(if changes.is_empty() { "No changes to review" } else { "No pending decisions" })))) )
 ))
                     .child(resizable_panel().size_range(window.rem_size() * 35. ..window.rem_size() * 120.)
-                        .child(if let Some(change) = active { self.render_review_detail(change, cx).into_any_element() } else {
+                        .child(if let Some(change) = active { if self.full_file_review.as_ref().is_some_and(|review| review.preview.change_id == change.id) {
+                            self.render_full_file_review(cx).into_any_element()
+                        } else { self.render_review_detail(change, cx).into_any_element() } } else {
                             div().p_5().child(if changes.is_empty() {
                                 if self.snapshot.blocked_targets.is_empty() { "Already in sync. The selected files were read successfully and no differences were found." } else { "One or more targets could not be checked. This does not mean they are in sync." }
                             } else { "All decisions are made. Clear Pending to revisit an item." }).into_any_element()
@@ -1597,7 +1933,7 @@ impl Workspace {
                         this.send(Command::CancelReview, "Returning to your saved selection", cx);
                     })))
                 .child(Button::new("apply-reviewed").primary().label("Confirm sync…")
-                    .disabled(self.busy.is_some() || unresolved > 0 || needs_details || changes.is_empty())
+                    .disabled(self.busy.is_some() || self.full_file_review.is_some() || unresolved > 0 || needs_details || changes.is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.confirm_apply(window, cx)))))
     }
 }

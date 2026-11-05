@@ -221,10 +221,19 @@ export async function handle(request) {
   let lock;
   const temps = new Set();
   try {
-    if (!object(request) || !['snapshot', 'export-models', 'apply'].includes(request.op)) fail('INVALID_REQUEST');
+    if (!object(request) || !['snapshot', 'export-models', 'review-models', 'apply'].includes(request.op)) fail('INVALID_REQUEST');
     const dir = await safeLocation(request);
     const meta = path.join(dir, '.harness-sync');
     const files = { settings: path.join(dir, 'settings.json'), state: path.join(meta, 'shared-state.json'), models: path.join(dir, 'models.json'), mcp: path.join(dir, 'mcp.json'), subagents: path.join(dir, 'subagents.json') };
+    if (request.op === 'review-models') {
+      if (request.approved !== true) fail('APPROVAL_REQUIRED');
+      if (!own(request, 'expectedHash') || (request.expectedHash !== null &&
+          (typeof request.expectedHash !== 'string' || !/^[a-f0-9]{64}$/.test(request.expectedHash))))
+        fail('EXPECTED_HASH_REQUIRED');
+      const record = await read(files.models, true);
+      if (record.hash !== request.expectedHash) fail('TARGET_CHANGED');
+      return { ok: true, hash: record.hash, modelsBase64: record.bytes?.toString('base64') ?? '' };
+    }
     if (request.op === 'export-models') {
       const record = await read(files.models, true);
       if (!record.exists) fail('SOURCE_MODELS_MISSING');

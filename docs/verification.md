@@ -1,5 +1,13 @@
 # Verification record
 
+## Complete changed-file review · 2026-11-05
+
+- Added explicit local full-file inspection for models, custom files, settings, MCP and subagents. The view is read-only; structured JSON includes the target-only values preserved by the actual merge, and labels undecided fields as provisional. Text and hexadecimal pages are complete, with no silent truncation. Opening, paging and closing the reader do not choose versions or apply changes.
+- All 159 backend tests and 70 desktop tests passed, including approval/scope checks, target model hash binding, full custom-file text/hex reconstruction, malformed targets, unchanged default redaction, actual MCP merge output, pending decisions, cancellation, stale replies, failed-read recovery, and read-only native controls. The final workspace rerun passed all 25 core tests and the fixture diagnostic as well.
+- The first workspace run hit the pre-existing fragmented askpass Broken pipe timing flake. Its isolated rerun and the unchanged full workspace rerun passed. No sync-core code was modified.
+- Workspace/all-targets/all-features Clippy with warnings denied, formatting, the public-source scan, and real GPUI/WGPU full-file and entry-point renders passed. Captures use only synthetic data. The entry toolbar wraps at narrow widths; full-file paging and private-content reveal remain separate from sync confirmation.
+- No real device connection or apply was performed. Native Windows/macOS behavior, explicit SSH/helper integration, accessibility tools, and remote CI for this change have not been run locally. Remote CI must be checked for the exact published commit.
+
 ## Independent version choices and navigation · 2026-11-05
 
 - `cargo test --locked --workspace`: 63 desktop tests, 25 core tests and the fixture diagnostic passed locally. Updated real-pointer regressions cover Source → right arrow and Target → left arrow without changing choices, undecided/default choices across file boundaries, unresolved Pending items, unavailable-source backward navigation, disabled boundaries, and Enter/Space navigation. A new hover regression verifies content → arrow → content cues without advertising a choice over an arrow. Existing selection/scroll and held-pointer guards remain covered.

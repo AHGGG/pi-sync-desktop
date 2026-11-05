@@ -2028,3 +2028,224 @@ fn arrow_hover_has_no_version_choice_cue_and_content_hover_recovers(cx: &mut Tes
     })
     .unwrap();
 }
+
+fn full_file_page(change_id: &str, page: usize, format: &str) -> crate::ui_model::FilePreview {
+    crate::ui_model::FilePreview {
+        plan_id: "review-1".into(),
+        change_id: change_id.into(),
+        file_name: "models.json".into(),
+        page,
+        page_count: 2,
+        format: format.into(),
+        unresolved: 0,
+        before: "{\n  \"fixture\": \"before\"\n}\n".into(),
+        after: "{\n  \"fixture\": \"after\"\n}\n".into(),
+    }
+}
+
+#[gpui_kit::test]
+fn full_file_review_requires_reveal_and_never_selects_or_applies(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, _| {
+            view.snapshot.changes[0].id = "target:models:/".into();
+            view.snapshot.changes[0].path = "models.json · entire private file".into();
+        });
+        window.render_frame(cx);
+        window.click("review-full-file", cx);
+        assert!(
+            received.try_recv().is_err(),
+            "opening approval must not fetch contents"
+        );
+        window.within("dialog").click("cancel", cx);
+        assert!(received.try_recv().is_err());
+        window.click("review-full-file", cx);
+        window.within("dialog").click("ok", cx);
+        match received.try_recv().expect("approved read") {
+            Command::ReviewFile {
+                plan_id,
+                change_id,
+                page,
+                choices,
+            } => {
+                assert_eq!(plan_id, "review-1");
+                assert_eq!(change_id, "target:models:/");
+                assert_eq!(page, 0);
+                assert!(choices.is_empty());
+            }
+            _ => panic!("only full-file read is allowed"),
+        }
+        view.update(cx, |view, cx| {
+            view.receive(
+                crate::ui_model::Event::FilePreview(full_file_page("target:models:/", 0, "text")),
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert!(!window.find_all("full-file-review").is_empty());
+        assert!(window.find_all("choose-source-target:models:/").is_empty());
+        assert_eq!(window.find("previous-file-page").disabled(), Some(true));
+        assert_ne!(window.find("next-file-page").disabled(), Some(true));
+        assert_eq!(window.find("apply-reviewed").disabled(), Some(true));
+        window.press("alt-left", cx);
+        window.press("alt-right", cx);
+        assert!(view.read(cx).choices.is_empty());
+        assert!(received.try_recv().is_err());
+        window.click("next-file-page", cx);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Command::ReviewFile { page: 1, .. })
+        ));
+        view.update(cx, |view, cx| {
+            view.receive(
+                crate::ui_model::Event::FilePreview(full_file_page("target:models:/", 1, "text")),
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("next-file-page").disabled(), Some(true));
+        assert_ne!(window.find("previous-file-page").disabled(), Some(true));
+        assert!(view.read(cx).choices.is_empty());
+        window.click("close-full-file", cx);
+        assert!(view.read(cx).full_file_review.is_none());
+        assert!(view.read(cx).file_review_request.is_none());
+        assert!(!window.find_all("choose-source-target:models:/").is_empty());
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn full_file_replies_are_discarded_after_navigation_cancel_or_new_plan(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.request_file_review("change".into(), 0, cx)
+        });
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Command::ReviewFile { .. })
+        ));
+        view.update(cx, |view, cx| {
+            view.close_file_review();
+            view.receive(
+                crate::ui_model::Event::FilePreview(full_file_page("change", 0, "json")),
+                window,
+                cx,
+            );
+        });
+        assert!(view.read(cx).full_file_review.is_none());
+        view.update(cx, |view, cx| {
+            view.request_file_review("change".into(), 0, cx);
+            view.invalidate_review();
+            view.receive(
+                crate::ui_model::Event::FilePreview(full_file_page("change", 0, "json")),
+                window,
+                cx,
+            );
+        });
+        assert!(view.read(cx).full_file_review.is_none());
+        assert!(view.read(cx).snapshot.plan_id.is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn structured_full_file_request_carries_choices_without_resolving_them(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.snapshot.changes[0].id = "target:mcp:/mcpServers/argent/command".into();
+            view.snapshot.changes[0].path = "mcp.json/mcpServers/argent/command".into();
+            view.choices
+                .insert(view.snapshot.changes[0].id.clone(), Choice::Target);
+            view.request_file_review(view.snapshot.changes[0].id.clone(), 0, cx);
+        });
+        match received.try_recv().expect("file review read") {
+            Command::ReviewFile { choices, .. } => assert_eq!(
+                choices["target:mcp:/mcpServers/argent/command"],
+                Choice::Target
+            ),
+            _ => panic!("only file review read is allowed"),
+        }
+        let mut page = full_file_page("target:mcp:/mcpServers/argent/command", 0, "json");
+        page.unresolved = 2;
+        page.file_name = "mcp.json".into();
+        view.update(cx, |view, cx| {
+            view.receive(crate::ui_model::Event::FilePreview(page), window, cx)
+        });
+        window.render_frame(cx);
+        assert!(!view.read(cx).snapshot.command_details_reviewed);
+        assert!(
+            gpui_kit::base::test_support::texts(window)
+                .iter()
+                .any(|text| text.text().contains("2 undecided fields"))
+        );
+        assert!(
+            !view
+                .read(cx)
+                .full_file_review
+                .as_ref()
+                .unwrap()
+                .source
+                .read(cx)
+                .is_editable()
+        );
+        assert!(
+            !view
+                .read(cx)
+                .full_file_review
+                .as_ref()
+                .unwrap()
+                .target
+                .read(cx)
+                .is_editable()
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn unavailable_source_cannot_open_full_file_review(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, _| {
+            view.snapshot.changes[0].source_available = false
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("review-full-file").disabled(), Some(true));
+        window.click("review-full-file", cx);
+        assert!(received.try_recv().is_err());
+        assert!(view.read(cx).file_review_request.is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn failed_full_file_read_restores_review_keyboard(cx: &mut TestAppContext) {
+    let (handle, view, received) = window(cx, true);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.request_file_review("change".into(), 0, cx)
+        });
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Command::ReviewFile { .. })
+        ));
+        view.update(cx, |view, cx| {
+            view.receive(
+                crate::ui_model::Event::Error("Target changed. Prepare again.".into()),
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert!(view.read(cx).file_review_request.is_none());
+        window.press("alt-right", cx);
+        assert_eq!(view.read(cx).choices.get("change"), Some(&Choice::Target));
+        assert!(received.try_recv().is_err());
+    })
+    .unwrap();
+}
